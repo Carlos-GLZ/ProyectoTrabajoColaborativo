@@ -1,14 +1,17 @@
-# SCRIPT 1: create-infrastructure.sh
-# Crea VPC, EC2 y toda la infraestructura necesaria
+#!/bin/bash
+
+# ============================================================================
+# SCRIPT: create-infrastructure.sh
+# Crea VPC, EC2 y toda la infraestructura necesaria para PitchZone en AWS
 # ============================================================================
 
-#!/bin/bash
+set -e  # Salir ante cualquier error
 
 # Configuración de variables
 PROJECT_NAME="pitchzone"
-REGION="us-east-1"  # Cambiar según tu región preferida
+REGION="us-east-1"                # Cambia por tu región preferida si es necesario
 KEY_NAME="pitchzone-key"
-INSTANCE_TYPE="t2.micro"  # Free tier elegible
+INSTANCE_TYPE="t2.micro"          # Free tier elegible
 
 echo "🚀 Iniciando creación de infraestructura para PitchZone..."
 
@@ -21,12 +24,7 @@ VPC_ID=$(aws ec2 create-vpc \
     --output text \
     --region $REGION)
 
-if [ $? -eq 0 ]; then
-    echo "✅ VPC creada exitosamente: $VPC_ID"
-else
-    echo "❌ Error creando VPC"
-    exit 1
-fi
+echo "✅ VPC creada exitosamente: $VPC_ID"
 
 # Habilitar DNS hostname y resolution
 aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames --region $REGION
@@ -137,14 +135,13 @@ echo "✅ Reglas de Security Group configuradas"
 
 # Crear Key Pair si no existe
 echo "🔑 Verificando/Creando Key Pair..."
-aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION > /dev/null 2>&1
-if [ $? -ne 0 ]; then
+if ! aws ec2 describe-key-pairs --key-names $KEY_NAME --region $REGION > /dev/null 2>&1; then
     aws ec2 create-key-pair \
         --key-name $KEY_NAME \
         --query 'KeyMaterial' \
         --output text \
         --region $REGION > ${KEY_NAME}.pem
-    
+
     chmod 400 ${KEY_NAME}.pem
     echo "✅ Key Pair creado: ${KEY_NAME}.pem"
 else
