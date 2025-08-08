@@ -1,0 +1,12 @@
+VPC_ID=vpc-052c9432da02d379f
+SUBNET_ID=subnet-0829b295d8ce7958a
+IGW_ID=igw-0eac519d21765ff6d
+RT_ID=rtb-061f75ec1d6e83482
+SEC_GRP_ID=sg-04fcc0cac0eca4375
+EC2_ID=i-0898c1de2078f5b37
+PUBLIC_IP=54.227.128.153
+KEY_NAME=pitchzone-key-1754632753
+KEY_PEM=/home/carlos-glz/ProyectoTrabajoColaborativo/pitchzone-key-1754632753.pem
+EC2_USER=ec2-user
+AMI_ID=ami-051f8a213df8bc089
+REGION=us-east-1

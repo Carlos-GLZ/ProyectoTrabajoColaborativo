@@ -1,112 +1,90 @@
-# SCRIPT 3: cleanup.sh
-# Elimina toda la infraestructura creada
-# ============================================================================
-
 #!/bin/bash
+set -euo pipefail
 
-# Cargar información de infraestructura
-if [ ! -f "infrastructure-info.txt" ]; then
-    echo "❌ No se encontró infrastructure-info.txt"
-    echo "📝 No hay infraestructura que eliminar o ya fue eliminada"
-    exit 1
+REGION="us-east-1"
+
+echo "=== 🔥 LIMPIEZA DE AWS Y LLAVES LOCALES ($REGION) ==="
+
+# 1) Instancias EC2 (running/stopped)
+echo "➡️ Eliminando instancias EC2..."
+EC2_IDS=$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+  --query "Reservations[].Instances[].InstanceId" --output text)
+if [[ -n "${EC2_IDS:-}" ]]; then
+  aws ec2 terminate-instances --instance-ids $EC2_IDS --region "$REGION" >/dev/null
+  aws ec2 wait instance-terminated --instance-ids $EC2_IDS --region "$REGION"
+  echo "✅ Instancias eliminadas."
+else
+  echo "⚠️ No hay instancias activas para eliminar."
 fi
 
-source infrastructure-info.txt
-
-echo "🗑️ Iniciando limpieza de infraestructura de PitchZone..."
-echo "⚠️ Esta acción eliminará TODA la infraestructura creada"
-read -p "¿Estás seguro? (y/N): " -n 1 -r
-echo
-
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "❌ Operación cancelada"
-    exit 1
+# 2) Borrar KeyPairs en AWS (opcional: limita por prefijo)
+echo "➡️ Eliminando KeyPairs en AWS..."
+KEYS=$(aws ec2 describe-key-pairs --region "$REGION" --query "KeyPairs[].KeyName" --output text)
+if [[ -n "${KEYS:-}" ]]; then
+  for KEY in $KEYS; do
+    # Si quieres solo tus llaves de proyecto, usa: [[ "$KEY" == pitchzone-* ]] || continue
+    echo "🗑️  AWS KeyPair: $KEY"
+    aws ec2 delete-key-pair --key-name "$KEY" --region "$REGION" || true
+  done
+else
+  echo "⚠️ No hay KeyPairs en AWS."
 fi
 
-echo "🚮 Eliminando recursos..."
+# 3) Borrar .pem locales (en el directorio actual)
+echo "➡️ Eliminando archivos .pem locales en $(pwd)..."
+find . -type f -name "*.pem" -print -delete || true
+echo "✅ Archivos .pem locales eliminados."
 
-# Terminar instancia EC2
-if [ ! -z "$INSTANCE_ID" ]; then
-    echo "🖥️ Terminando instancia EC2: $INSTANCE_ID"
-    aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
-    
-    echo "⏳ Esperando a que la instancia termine..."
-    aws ec2 wait instance-terminated --instance-ids $INSTANCE_ID --region $REGION
-    echo "✅ Instancia terminada"
+# 4) VPCs NO por defecto (con sus recursos)
+echo "➡️ Eliminando VPCs personalizadas..."
+VPCS=$(aws ec2 describe-vpcs --region "$REGION" \
+  --query "Vpcs[?IsDefault==\`false\`].VpcId" --output text)
+if [[ -n "${VPCS:-}" ]]; then
+  for VPC in $VPCS; do
+    echo "🗑️  VPC: $VPC"
+
+    # Desasociar y borrar IGW
+    IGWS=$(aws ec2 describe-internet-gateways --region "$REGION" \
+      --filters Name=attachment.vpc-id,Values=$VPC \
+      --query "InternetGateways[].InternetGatewayId" --output text)
+    for IGW in $IGWS; do
+      aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC" --region "$REGION" || true
+      aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" --region "$REGION" || true
+    done
+
+    # Subnets
+    SUBNETS=$(aws ec2 describe-subnets --region "$REGION" \
+      --filters Name=vpc-id,Values=$VPC --query "Subnets[].SubnetId" --output text)
+    for S in $SUBNETS; do
+      aws ec2 delete-subnet --subnet-id "$S" --region "$REGION" || true
+    done
+
+    # Route tables (no la principal)
+    RTBS=$(aws ec2 describe-route-tables --region "$REGION" \
+      --filters Name=vpc-id,Values=$VPC --query "RouteTables[].{Id:RouteTableId,Main:Associations[?Main].Main|[0]}" --output text)
+    # Salida tipo: "rtb-12345    True" o "rtb-67890    False"
+    while read -r RTB MAIN; do
+      [[ -z "${RTB:-}" ]] && continue
+      [[ "$MAIN" == "True" ]] && continue
+      aws ec2 delete-route-table --route-table-id "$RTB" --region "$REGION" || true
+    done <<< "$RTBS"
+
+    # Security Groups (no el default)
+    SGS=$(aws ec2 describe-security-groups --region "$REGION" \
+      --filters Name=vpc-id,Values=$VPC --query "SecurityGroups[].{Id:GroupId,Name:GroupName}" --output text)
+    while read -r SGID SGNAME; do
+      [[ -z "${SGID:-}" ]] && continue
+      [[ "$SGNAME" == "default" ]] && continue
+      aws ec2 delete-security-group --group-id "$SGID" --region "$REGION" 2>/dev/null || true
+    done <<< "$SGS"
+
+    # Finalmente, la VPC
+    aws ec2 delete-vpc --vpc-id "$VPC" --region "$REGION"
+    echo "✅ VPC $VPC eliminada."
+  done
+else
+  echo "⚠️ No hay VPCs personalizadas."
 fi
 
-# Eliminar Security Group
-if [ ! -z "$SG_ID" ]; then
-    echo "🔒 Eliminando Security Group: $SG_ID"
-    aws ec2 delete-security-group --group-id $SG_ID --region $REGION
-    echo "✅ Security Group eliminado"
-fi
-
-# Desasociar y eliminar tabla de rutas
-if [ ! -z "$ROUTE_TABLE_ID" ]; then
-    echo "🛣️ Eliminando tabla de rutas: $ROUTE_TABLE_ID"
-    
-    # Obtener asociaciones de la tabla de rutas
-    ASSOCIATIONS=$(aws ec2 describe-route-tables --route-table-ids $ROUTE_TABLE_ID --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text --region $REGION)
-    
-    # Desasociar si hay asociaciones
-    if [ ! -z "$ASSOCIATIONS" ]; then
-        for assoc in $ASSOCIATIONS; do
-            aws ec2 disassociate-route-table --association-id $assoc --region $REGION
-        done
-    fi
-    
-    # Eliminar rutas personalizadas
-    aws ec2 delete-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 0.0.0.0/0 --region $REGION 2>/dev/null || true
-    
-    # Eliminar tabla de rutas
-    aws ec2 delete-route-table --route-table-id $ROUTE_TABLE_ID --region $REGION
-    echo "✅ Tabla de rutas eliminada"
-fi
-
-# Eliminar subnet
-if [ ! -z "$SUBNET_ID" ]; then
-    echo "🏗️ Eliminando subnet: $SUBNET_ID"
-    aws ec2 delete-subnet --subnet-id $SUBNET_ID --region $REGION
-    echo "✅ Subnet eliminada"
-fi
-
-# Desadjuntar y eliminar Internet Gateway
-if [ ! -z "$IGW_ID" ] && [ ! -z "$VPC_ID" ]; then
-    echo "🌐 Desadjuntando Internet Gateway: $IGW_ID"
-    aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID --region $REGION
-    
-    echo "🌐 Eliminando Internet Gateway: $IGW_ID"
-    aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID --region $REGION
-    echo "✅ Internet Gateway eliminado"
-fi
-
-# Eliminar VPC
-if [ ! -z "$VPC_ID" ]; then
-    echo "📡 Eliminando VPC: $VPC_ID"
-    aws ec2 delete-vpc --vpc-id $VPC_ID --region $REGION
-    echo "✅ VPC eliminada"
-fi
-
-# Eliminar Key Pair (opcional - comentado por seguridad)
-# if [ ! -z "$KEY_NAME" ]; then
-#     echo "🔑 Eliminando Key Pair: $KEY_NAME"
-#     aws ec2 delete-key-pair --key-name $KEY_NAME --region $REGION
-#     rm -f ${KEY_NAME}.pem
-#     echo "✅ Key Pair eliminado"
-# fi
-
-# Limpiar archivos locales
-echo "🧹 Limpiando archivos locales..."
-rm -f infrastructure-info.txt
-rm -f deploy-pitchzone.sh
-rm -f user-data.sh
-
-echo ""
-echo "🎉 ¡Limpieza completada exitosamente!"
-echo "💰 Todos los recursos de AWS han sido eliminados"
-echo "📝 El Key Pair se mantiene por seguridad: ${KEY_NAME}.pem"
-echo "🗑️ Si no planeas usarlo más, elimínalo manualmente:"
-echo "   aws ec2 delete-key-pair --key-name $KEY_NAME --region $REGION"
-echo "   rm -f ${KEY_NAME}.pem"
-echo ""
+echo "🎯 Limpieza completada."
