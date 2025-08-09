@@ -45,7 +45,7 @@ upload_if_exists "$DB_FILE"
 upload_if_exists "$UNI_FILE"
 upload_if_exists "$EVENTS_FILE"
 
-# --- 2) Crear (o actualizar) plantilla CFN local del backend (corregida) ---
+# --- 2) Plantilla CFN del backend (corregida) ---
 CFN_FILE="pitchzone-backend.yml"
 cat > "$CFN_FILE" <<'YML'
 AWSTemplateFormatVersion: '2010-09-09'
@@ -324,7 +324,7 @@ if [ -z "$API_BASE" ] || [ "$API_BASE" = "None" ]; then
 fi
 echo "🌐 API_BASE: $API_BASE"
 
-# --- 4) Crear script remoto que genera HTML + seeds ---
+# --- 4) Script remoto: HTML + assets (SIN inyectar JSON en HTML) ---
 cat > deploy-pitchzone-enhanced.sh <<'RSCRIPT'
 #!/bin/bash
 set -euo pipefail
@@ -511,14 +511,14 @@ footer{background:linear-gradient(135deg,var(--primary-dark),#0F172A);color:#fff
   <p>© 2025 PitchZone • Desplegado en AWS EC2</p>
 </footer>
 
-<!-- Seeds (sed inyecta si existen archivos en /var/www/html) -->
-<script id="projectsSeed" type="application/json"><!--SEED-HERE--></script>
-<script id="universidadesSeed" type="application/json"><!--UNIVERSIDADES-SEED--></script>
-<script id="eventsSeed" type="application/json"><!--EVENTS-SEED--></script>
+<!-- Seeds (marcadores vacíos: NO se inyectan JSON en el HTML) -->
+<script id="projectsSeed" type="application/json"></script>
+<script id="universidadesSeed" type="application/json"></script>
+<script id="eventsSeed" type="application/json"></script>
 
 <script>
 // ========= CONFIG =========
-const API_BASE = "%%API_BASE%%";                 // ← se reemplaza por sed
+const API_BASE = "%%API_BASE%%";
 const API_PROJECTS = API_BASE + "/projects";
 // ==========================
 
@@ -662,7 +662,7 @@ async function submitProject(event){
 }
 </script>
 
-<!-- Modales mínimos (sube tu proyecto) -->
+<!-- Modal -->
 <div id="uploadModal" class="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9990;">
   <div class="modal-content" style="background:#fff;margin:5% auto;padding:30px;max-width:600px;border-radius:16px;position:relative;color:#012538">
     <span style="position:absolute;top:10px;right:16px;font-size:28px;cursor:pointer" onclick="this.closest('.modal').style.display='none';document.body.style.overflow='auto';">&times;</span>
@@ -686,40 +686,15 @@ async function submitProject(event){
 </html>
 HTMLEOF
 
-# Inyectar seed de proyectos si existe
-if [ -f /var/www/html/proyectos.json ]; then
-  sudo sed -i '/<!--SEED-HERE-->/{
-    r /var/www/html/proyectos.json
-    d
-  }' /var/www/html/index.html
-else
-  sudo sed -i 's/<!--SEED-HERE-->//g' /var/www/html/index.html
-fi
-
-# Inyectar seed de universidades si existe
-if [ -f /var/www/html/universidades.json ]; then
-  sudo sed -i '/<!--UNIVERSIDADES-SEED-->/{
-    r /var/www/html/universidades.json
-    d
-  }' /var/www/html/index.html
-else
-  sudo sed -i 's/<!--UNIVERSIDADES-SEED-->//g' /var/www/html/index.html
-fi
-
-# Inyectar seed de eventos si existe
-if [ -f /var/www/html/eventos.json ]; then
-  sudo sed -i '/<!--EVENTS-SEED-->/{
-    r /var/www/html/eventos.json
-    d
-  }' /var/www/html/index.html
-else
-  sudo sed -i 's/<!--EVENTS-SEED-->//g' /var/www/html/index.html
-fi
+# (💡 Importante) NO INYECTAR JSON EN EL HTML: solo quitar marcadores
+sudo sed -i 's/<!--SEED-HERE-->//g' /var/www/html/index.html
+sudo sed -i 's/<!--UNIVERSIDADES-SEED-->//g' /var/www/html/index.html
+sudo sed -i 's/<!--EVENTS-SEED-->//g' /var/www/html/index.html
 
 sudo chown -R apache:apache /var/www/html/
 sudo chmod -R 755 /var/www/html/
 sudo systemctl restart httpd
-echo "✅ Sitio desplegado (seeds aplicados si existían)."
+echo "✅ Sitio desplegado (sin inyectar JSON en HTML)."
 RSCRIPT
 
 chmod +x deploy-pitchzone-enhanced.sh
@@ -754,7 +729,5 @@ echo "🛠️  API:  $API_BASE"
 echo "   • POST $API_BASE/projects"
 echo "   • GET  $API_BASE/projects"
 echo ""
-echo "✅ Si el POST está activo, el botón 'Sube tu proyecto' guarda en DynamoDB."
+echo "✅ La página mantiene el diseño y funciona sin mostrar JSON en el HTML."
 echo ""
-
-
