@@ -1,0 +1,217 @@
+{
+  "alianzas_universitarias": [
+    {
+      "id": 1,
+      "nombre": "Universidad Nacional Autónoma de México",
+      "siglas": "UNAM",
+      "tipo": "Pública",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.unam.mx"
+    },
+    {
+      "id": 2,
+      "nombre": "Instituto Politécnico Nacional",
+      "siglas": "IPN",
+      "tipo": "Pública",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.ipn.mx"
+    },
+    {
+      "id": 3,
+      "nombre": "Tecnológico de Monterrey",
+      "siglas": "TEC",
+      "tipo": "Privada",
+      "ubicacion": "Monterrey, Nuevo León",
+      "sitio_web": "https://tec.mx"
+    },
+    {
+      "id": 4,
+      "nombre": "Universidad de Guadalajara",
+      "siglas": "UdeG",
+      "tipo": "Pública",
+      "ubicacion": "Guadalajara, Jalisco",
+      "sitio_web": "https://www.udg.mx"
+    },
+    {
+      "id": 5,
+      "nombre": "Universidad Autónoma Metropolitana",
+      "siglas": "UAM",
+      "tipo": "Pública",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.uam.mx"
+    },
+    {
+      "id": 6,
+      "nombre": "Universidad Iberoamericana",
+      "siglas": "UIA",
+      "tipo": "Privada",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.ibero.mx"
+    },
+    {
+      "id": 7,
+      "nombre": "Universidad Autónoma de Nuevo León",
+      "siglas": "UANL",
+      "tipo": "Pública",
+      "ubicacion": "San Nicolás de los Garza, Nuevo León",
+      "sitio_web": "https://www.uanl.mx"
+    },
+    {
+      "id": 8,
+      "nombre": "Universidad Panamericana",
+      "siglas": "UP",
+      "tipo": "Privada",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.up.edu.mx"
+    },
+    {
+      "id": 9,
+      "nombre": "Universidad Anáhuac",
+      "siglas": "ANAHUAC",
+      "tipo": "Privada",
+      "ubicacion": "Naucalpan, Estado de México",
+      "sitio_web": "https://www.anahuac.mx"
+    },
+    {
+      "id": 10,
+      "nombre": "Universidad La Salle",
+      "siglas": "ULSA",
+      "tipo": "Privada",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.lasalle.mx"
+    },
+    {
+      "id": 11,
+      "nombre": "Universidad del Valle de México",
+      "siglas": "UVM",
+      "tipo": "Privada",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.uvm.mx"
+    },
+    {
+      "id": 12,
+      "nombre": "Universidad Autónoma del Estado de México",
+      "siglas": "UAEM",
+      "tipo": "Pública",
+      "ubicacion": "Toluca, Estado de México",
+      "sitio_web": "https://www.uaemex.mx"
+    },
+    {
+      "id": 13,
+      "nombre": "Universidad Autónoma de Baja California",
+      "siglas": "UABC",
+      "tipo": "Pública",
+      "ubicacion": "Mexicali, Baja California",
+      "sitio_web": "https://www.uabc.mx"
+    },
+    {
+      "id": 14,
+      "nombre": "Universidad Veracruzana",
+      "siglas": "UV",
+      "tipo": "Pública",
+      "ubicacion": "Xalapa, Veracruz",
+      "sitio_web": "https://www.uv.mx"
+    },
+    {
+      "id": 15,
+      "nombre": "Universidad de las Américas Puebla",
+      "siglas": "UDLAP",
+      "tipo": "Privada",
+      "ubicacion": "Cholula, Puebla",
+      "sitio_web": "https://www.udlap.mx"
+    },
+    {
+      "id": 16,
+      "nombre": "Centro de Investigación y de Estudios Avanzados",
+      "siglas": "CINVESTAV",
+      "tipo": "Pública",
+      "ubicacion": "Ciudad de México",
+      "sitio_web": "https://www.cinvestav.mx"
+    },
+    {
+      "id": 17,
+      "nombre": "Universidad Autónoma de Yucatán",
+      "siglas": "UADY",
+      "tipo": "Pública",
+      "ubicacion": "Mérida, Yucatán",
+      "sitio_web": "https://www.uady.mx"
+    },
+    {
+      "id": 18,
+      "nombre": "Universidad Autónoma de San Luis Potosí",
+      "siglas": "UASLP",
+      "tipo": "Pública",
+      "ubicacion": "San Luis Potosí, San Luis Potosí",
+      "sitio_web": "https://www.uaslp.mx"
+    },
+    {
+      "id": 19,
+      "nombre": "Universidad Autónoma de Coahuila",
+      "siglas": "UAdeC",
+      "tipo": "Pública",
+      "ubicacion": "Saltillo, Coahuila",
+      "sitio_web": "https://www.uadec.mx"
+    },
+    {
+      "id": 20,
+      "nombre": "Universidad Autónoma de Chihuahua",
+      "siglas": "UACH",
+      "tipo": "Pública",
+      "ubicacion": "Chihuahua, Chihuahua",
+      "sitio_web": "https://www.uach.mx"
+    },
+    {
+      "id": 21,
+      "nombre": "Universidad Autónoma de Sinaloa",
+      "siglas": "UAS",
+      "tipo": "Pública",
+      "ubicacion": "Culiacán, Sinaloa",
+      "sitio_web": "https://www.uas.edu.mx"
+    },
+    {
+      "id": 22,
+      "nombre": "Universidad Autónoma de Querétaro",
+      "siglas": "UAQ",
+      "tipo": "Pública",
+      "ubicacion": "Santiago de Querétaro, Querétaro",
+      "sitio_web": "https://www.uaq.mx"
+    },
+    {
+      "id": 23,
+      "nombre": "Universidad Autónoma Benito Juárez de Oaxaca",
+      "siglas": "UABJO",
+      "tipo": "Pública",
+      "ubicacion": "Oaxaca de Juárez, Oaxaca",
+      "sitio_web": "https://www.uabjo.mx"
+    },
+    {
+      "id": 24,
+      "nombre": "Universidad Autónoma de Aguascalientes",
+      "siglas": "UAA",
+      "tipo": "Pública",
+      "ubicacion": "Aguascalientes, Aguascalientes",
+      "sitio_web": "https://www.uaa.mx"
+    },
+    {
+      "id": 25,
+      "nombre": "Global University",
+      "siglas": "GU",
+      "tipo": "Privada",
+      "ubicacion": "Aguascalientes, Aguascalientes",
+      "sitio_web": "https://www.globaluniversity.edu.mx"
+    }
+  ],
+  "metadatos": {
+    "total_universidades": 25,
+    "fecha_actualizacion": "2025-08-08",
+    "proposito": "Alianzas Universitarias - Información fundamental",
+    "campos_incluidos": [
+      "id",
+      "nombre",
+      "siglas", 
+      "tipo",
+      "ubicacion",
+      "sitio_web"
+    ]
+  }
+}

@@ -1,1469 +1,760 @@
 #!/bin/bash
+set -euo pipefail
 
 # =============================== #
 #  PitchZone - deploy-web-site.sh #
-#        VERSIÓN MEJORADA         #
+#      WEB + BACKEND (CFN)        #
 # =============================== #
 
-# 1. Leer archivo de datos de infraestructura
+# --- 0) Infra info ---
 if [ ! -f "infraestructura-info.txt" ]; then
-    echo "❌ No se encontró infraestructura-info.txt"
-    echo "📝 Ejecuta primero create-infraestructura.sh"
-    exit 1
+  echo "❌ No se encontró infraestructura-info.txt"
+  echo "📝 Ejecuta primero create-infraestructura.sh"
+  exit 1
 fi
-
-# Importar variables del archivo
+# shellcheck disable=SC1091
 source infraestructura-info.txt
+
+: "${PUBLIC_IP:?PUBLIC_IP faltante en infraestructura-info.txt}"
+: "${KEY_PEM:?KEY_PEM faltante en infraestructura-info.txt}"
+
+EC2_USER="${EC2_USER:-ec2-user}"
+REMOTE="$EC2_USER@$PUBLIC_IP"
 
 echo "🚀 Iniciando despliegue MEJORADO de PitchZone en $PUBLIC_IP ..."
 
-# 2. Preparar y subir logo si existe
+# --- 1) Archivos locales opcionales ---
 LOGO_FILE="logo_pitchzone.png"
-UPLOAD_LOGO=false
-
-if [ -f "$LOGO_FILE" ]; then
-    echo "🖼️  Logo detectado: $LOGO_FILE. Será subido a la EC2."
-    scp -i "$KEY_PEM" -o StrictHostKeyChecking=no "$LOGO_FILE" ec2-user@"$PUBLIC_IP":/tmp/
-    UPLOAD_LOGO=true
-else
-    echo "⚠️  No se encontró $LOGO_FILE. IMPORTANTE: Guarda tu logo como 'logo_pitchzone.png'"
-    echo "📋 El sitio funcionará pero sin tu logo personalizado."
-fi
-
-# 2.1 Preparar y subir base de datos JSON si existe
 DB_FILE="proyectos.json"
-UPLOAD_DB=false
+UNI_FILE="universidades.json"
+EVENTS_FILE="eventos.json"
 
-if [ -f "$DB_FILE" ]; then
-    echo "📦 Base de datos detectada: $DB_FILE. Será subida a la EC2."
-    scp -i "$KEY_PEM" -o StrictHostKeyChecking=no "$DB_FILE" ec2-user@"$PUBLIC_IP":/tmp/
-    UPLOAD_DB=true
-else
-    echo "ℹ️  No se encontró $DB_FILE. Se usarán proyectos de ejemplo."
+upload_if_exists () {
+  local f="$1"
+  local dst="/tmp/"
+  if [ -f "$f" ]; then
+    echo "⬆️  Subiendo $f ..."
+    scp -i "$KEY_PEM" -o StrictHostKeyChecking=no "$f" "$REMOTE":"$dst"
+  else
+    echo "ℹ️  No se encontró $f (se usará seed/demo)."
+  fi
+}
+
+upload_if_exists "$LOGO_FILE"
+upload_if_exists "$DB_FILE"
+upload_if_exists "$UNI_FILE"
+upload_if_exists "$EVENTS_FILE"
+
+# --- 2) Crear (o actualizar) plantilla CFN local del backend (corregida) ---
+CFN_FILE="pitchzone-backend.yml"
+cat > "$CFN_FILE" <<'YML'
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PitchZone backend - API Gateway + Lambda + DynamoDB (POST/GET projects)
+
+Parameters:
+  TableName:
+    Type: String
+    Default: pitchzone-projects
+  StageName:
+    Type: String
+    Default: prod
+  CorsAllowOrigin:
+    Type: String
+    Default: "*"
+
+Resources:
+  ProjectsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: createdAtIndex
+          KeySchema:
+            - AttributeName: createdAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName removido para evitar conflictos de nombre
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoWriteRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ProjectsTable.Arn
+                  - !Sub "${ProjectsTable.Arn}/index/*"
+
+  PostProjectLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pitchzone-post-project-${AWS::StackName}
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          CORS_ORIGIN: !Ref CorsAllowOrigin
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ddb = new AWS.DynamoDB.DocumentClient();
+          const crypto = require('crypto');
+          const TABLE = process.env.TABLE_NAME;
+
+          exports.handler = async (event) => {
+            try {
+              const method = (event?.requestContext?.http?.method || event.httpMethod || '').toUpperCase();
+              if (method === 'OPTIONS') return cors(200, { ok: true });
+
+              const body = event.body ? JSON.parse(event.body) : {};
+              const req = ["nombre_proyecto","descripcion","integrantes","funding_necesario","categoria"];
+              for (const k of req) {
+                if (body[k] === undefined || body[k] === null || String(body[k]).trim() === "") {
+                  return cors(400, { ok:false, error:`Falta campo: ${k}` });
+                }
+              }
+              if (!Array.isArray(body.integrantes)) {
+                return cors(400, { ok:false, error:"'integrantes' debe ser array" });
+              }
+
+              const id = crypto.randomUUID();
+              const now = new Date().toISOString();
+
+              const item = {
+                id,
+                nombre_proyecto: String(body.nombre_proyecto),
+                descripcion: String(body.descripcion),
+                integrantes: body.integrantes,
+                funding_necesario: Number(body.funding_necesario),
+                categoria: String(body.categoria),
+                createdAt: now
+              };
+
+              await ddb.put({ TableName: TABLE, Item: item }).promise();
+              return cors(201, { ok:true, id, createdAt: now });
+            } catch (err) {
+              console.error(err);
+              return cors(500, { ok:false, error:"Error interno" });
+            }
+          };
+
+          function cors(statusCode, body){
+            return {
+              statusCode,
+              headers: {
+                "Content-Type":"application/json",
+                "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+                "Access-Control-Allow-Headers":"*",
+                "Access-Control-Allow-Methods":"OPTIONS,POST,GET"
+              },
+              body: JSON.stringify(body)
+            };
+          }
+
+  GetProjectsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pitchzone-get-projects-${AWS::StackName}
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          CORS_ORIGIN: !Ref CorsAllowOrigin
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ddb = new AWS.DynamoDB.DocumentClient();
+          const TABLE = process.env.TABLE_NAME;
+
+          exports.handler = async (event) => {
+            try {
+              const method = (event?.requestContext?.http?.method || event.httpMethod || '').toUpperCase();
+              if (method === 'OPTIONS') return cors(200, { ok: true });
+
+              const scan = await ddb.scan({ TableName: TABLE }).promise();
+              const items = scan.Items || [];
+              items.sort((a,b) => String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
+              return cors(200, items);
+            } catch (err) {
+              console.error(err);
+              return cors(500, { ok:false, error:"Error interno" });
+            }
+          };
+
+          function cors(statusCode, body){
+            return {
+              statusCode,
+              headers: {
+                "Content-Type":"application/json",
+                "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+                "Access-Control-Allow-Headers":"*",
+                "Access-Control-Allow-Methods":"OPTIONS,POST,GET"
+              },
+              body: JSON.stringify(body)
+            };
+          }
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub pitchzone-api-${AWS::StackName}
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods: [ "OPTIONS", "GET", "POST" ]
+        AllowOrigins: [ !Ref CorsAllowOrigin ]
+        AllowHeaders: [ "*" ]
+
+  PostProjectsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PostProjectLambda.Arn}/invocations
+      PayloadFormatVersion: "2.0"
+
+  GetProjectsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetProjectsLambda.Arn}/invocations
+      PayloadFormatVersion: "2.0"
+
+  PostProjectsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /projects"
+      Target: !Sub "integrations/${PostProjectsIntegration}"
+
+  GetProjectsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /projects"
+      Target: !Sub "integrations/${GetProjectsIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref StageName
+      AutoDeploy: true
+
+  AllowInvokePost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PostProjectLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/projects
+
+  AllowInvokeGet:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetProjectsLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/GET/projects
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL de la API
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  PostProjectsEndpoint:
+    Description: Endpoint POST para crear proyectos
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/projects
+  GetProjectsEndpoint:
+    Description: Endpoint GET para listar proyectos
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/projects
+  DynamoTableName:
+    Description: Nombre de la tabla DynamoDB
+    Value: !Ref TableName
+YML
+
+# --- 3) Desplegar/actualizar backend ---
+STACK_NAME="pitchzone-backend"
+TABLE_NAME="pitchzone-projects"
+STAGE_NAME="prod"
+CORS_ORIGIN="*"
+
+echo "📡 Desplegando backend (CloudFormation) ..."
+aws cloudformation deploy \
+  --stack-name "$STACK_NAME" \
+  --template-file "$CFN_FILE" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides TableName="$TABLE_NAME" StageName="$STAGE_NAME" CorsAllowOrigin="$CORS_ORIGIN"
+
+API_BASE="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --query "Stacks[0].Outputs[?OutputKey=='ApiBaseUrl'].OutputValue" --output text)"
+
+if [ -z "$API_BASE" ] || [ "$API_BASE" = "None" ]; then
+  echo "❌ No pude obtener ApiBaseUrl del stack"
+  exit 1
 fi
+echo "🌐 API_BASE: $API_BASE"
 
-# 3. Crear script de despliegue remoto MEJORADO
-cat > deploy-pitchzone-enhanced.sh <<'EOF'
+# --- 4) Crear script remoto que genera HTML + seeds ---
+cat > deploy-pitchzone-enhanced.sh <<'RSCRIPT'
 #!/bin/bash
+set -euo pipefail
 
-echo "🔧 Configurando sistema..."
+echo "🔧 Configurando Apache..."
+sudo yum update -y || true
+sudo yum install -y httpd || true
+sudo systemctl enable --now httpd
 
-# Actualizar sistema y preparar Apache
-sudo yum update -y
-sudo yum install -y httpd
-
-# Configurar Apache para mejor rendimiento
+# Conf básica
 sudo bash -c 'cat > /etc/httpd/conf.d/pitchzone.conf' <<APACHEEOF
-# Configuración optimizada para PitchZone
 ServerTokens Prod
 ServerSignature Off
-
-# Habilitar compresión
-LoadModule deflate_module modules/mod_deflate.so
-<Location />
-    SetOutputFilter DEFLATE
-    SetEnvIfNoCase Request_URI \.(?:gif|jpe?g|png)$ no-gzip dont-vary
-    SetEnvIfNoCase Request_URI \.(?:exe|t?gz|zip|bz2|sit|rar)$ no-gzip dont-vary
-</Location>
-
-# Habilitar caché
-LoadModule expires_module modules/mod_expires.so
-ExpiresActive On
-ExpiresByType text/css "access plus 1 month"
-ExpiresByType application/javascript "access plus 1 month"
-ExpiresByType image/png "access plus 1 month"
-ExpiresByType image/jpg "access plus 1 month"
-ExpiresByType image/jpeg "access plus 1 month"
-
-# Headers de seguridad
-Header always set X-Frame-Options DENY
-Header always set X-Content-Type-Options nosniff
-Header always set Referrer-Policy "strict-origin-when-cross-origin"
+<IfModule mod_headers.c>
+  Header always set X-Frame-Options DENY
+  Header always set X-Content-Type-Options nosniff
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
 APACHEEOF
+sudo systemctl restart httpd || true
 
-sudo systemctl start httpd
-sudo systemctl enable httpd
+# Mover assets si llegaron
+[ -f /tmp/logo_pitchzone.png ] && sudo mv /tmp/logo_pitchzone.png /var/www/html/logo_pitchzone.png && sudo chown apache:apache /var/www/html/logo_pitchzone.png && sudo chmod 644 /var/www/html/logo_pitchzone.png
+[ -f /tmp/proyectos.json ] && sudo mv /tmp/proyectos.json /var/www/html/proyectos.json && sudo chown apache:apache /var/www/html/proyectos.json && sudo chmod 644 /var/www/html/proyectos.json
+[ -f /tmp/universidades.json ] && sudo mv /tmp/universidades.json /var/www/html/universidades.json && sudo chown apache:apache /var/www/html/universidades.json && sudo chmod 644 /var/www/html/universidades.json
+[ -f /tmp/eventos.json ] && sudo mv /tmp/eventos.json /var/www/html/eventos.json && sudo chown apache:apache /var/www/html/eventos.json && sudo chmod 644 /var/www/html/eventos.json
 
-# Configurar firewall
-sudo systemctl start firewalld 2>/dev/null || echo "Firewalld no disponible"
-sudo firewall-cmd --permanent --add-service=http 2>/dev/null || echo "Firewall configurado manualmente"
-sudo firewall-cmd --reload 2>/dev/null || echo "Firewall reload manual"
-
-# Mover y configurar archivos
-if [ -f /tmp/logo_pitchzone.png ]; then
-    echo "✅ Configurando logo personalizado..."
-    sudo mv /tmp/logo_pitchzone.png /var/www/html/logo_pitchzone.png
-    sudo chown apache:apache /var/www/html/logo_pitchzone.png
-    sudo chmod 644 /var/www/html/logo_pitchzone.png
-    LOGO_AVAILABLE=true
-else
-    echo "⚠️  Logo no encontrado, creando logo de respaldo..."
-    # Crear un logo SVG simple como respaldo
-    sudo bash -c 'cat > /var/www/html/logo_pitchzone.png' <<LOGOEOF
-data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgdmlld0JveD0iMCAwIDEyMCAxMjAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiByeD0iMjQiIGZpbGw9InVybCgjZ3JhZGllbnQwX2xpbmVhcl8xXzIpIi8+CjxwYXRoIGQ9Ik02MCA5MEM3NS42IDkwIDg3IDc4LjYgODcgNjNDODcgNDcuNCA3NS42IDM2IDYwIDM2QzQ0LjQgMzYgMzMgNDcuNCAzMyA2M0MzMyA3OC42IDQ0LjQgOTAgNjAgOTBaIiBmaWxsPSJ3aGl0ZSIvPgo8dGV4dCB4PSI2MCIgeT0iNzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtZmFtaWx5PSJNb250c2VycmF0IiBmb250LXNpemU9IjI0IiBmb250LXdlaWdodD0iODAwIiBmaWxsPSIjMDEyNTM4Ij5QPC90ZXh0Pgo8ZGVmcz4KPGxpbmVhckdyYWRpZW50IGlkPSJncmFkaWVudDBfbGluZWFyXzFfMiIgeDE9IjAiIHkxPSIwIiB4Mj0iMTIwIiB5Mj0iMTIwIiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+CjxzdG9wIHN0b3AtY29sb3I9IiNGQjk4MzMiLz4KPHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMUI3NjhFIi8+CjwvbGluZWFyR3JhZGllbnQ+CjwvZGVmcz4KPHN2Zz4K
-LOGOEOF
-    LOGO_AVAILABLE=false
-fi
-
-# Configurar base de datos
-if [ -f /tmp/proyectos.json ]; then
-    echo "✅ Configurando base de datos..."
-    sudo mv /tmp/proyectos.json /var/www/html/proyectos.json
-    sudo chown apache:apache /var/www/html/proyectos.json
-    sudo chmod 644 /var/www/html/proyectos.json
-    DB_AVAILABLE=true
-else
-    echo "ℹ️  Base de datos no encontrada, se usarán proyectos de ejemplo"
-    DB_AVAILABLE=false
-fi
-
-echo "🎨 Creando página web funcional..."
-
-# Crear el archivo HTML mejorado
+echo "🎨 Generando index.html ..."
 sudo bash -c 'cat > /var/www/html/index.html' <<'HTMLEOF'
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PitchZone - Súbelo. Preséntalo. Véndelo.</title>
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800&display=swap" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <style>
-        :root {
-            --primary-orange: #FB9833;
-            --primary-light: #FCEFEF;
-            --primary-teal: #1B768E;
-            --primary-dark: #012538;
-            --primary-gray: #4D555B;
-            --success-green: #10B981;
-            --warning-yellow: #F59E0B;
-        }
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: "Montserrat", Arial, sans-serif;
-            background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-teal) 100%);
-            color: var(--primary-light);
-            min-height: 100vh;
-            overflow-x: hidden;
-        }
-        
-        header {
-            background: rgba(1,37,56,0.95);
-            backdrop-filter: blur(10px);
-            padding: 15px 40px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            border-bottom: 2px solid var(--primary-teal);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            transition: all 0.3s ease;
-        }
-        
-        .logo-zone {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            cursor: pointer;
-            transition: transform 0.3s ease;
-        }
-        
-        .logo-zone:hover {
-            transform: scale(1.05);
-        }
-        
-        .logo-zone img {
-            height: 45px;
-            border-radius: 12px;
-            box-shadow: 0 0 20px rgba(251, 152, 51, 0.5);
-            transition: box-shadow 0.3s ease;
-        }
-        
-        .logo-zone span {
-            font-weight: 800;
-            font-size: 1.8em;
-            letter-spacing: 2px;
-            background: linear-gradient(45deg, var(--primary-orange), var(--primary-teal));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        
-        nav {
-            display: flex;
-            gap: 25px;
-        }
-        
-        nav a {
-            color: var(--primary-light);
-            text-decoration: none;
-            font-weight: 600;
-            letter-spacing: 1px;
-            transition: all 0.3s ease;
-            padding: 8px 16px;
-            border-radius: 20px;
-        }
-        
-        nav a:hover {
-            color: var(--primary-orange);
-            background: rgba(251, 152, 51, 0.1);
-            transform: translateY(-2px);
-        }
-        
-        .hero {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 80px 20px 60px;
-            text-align: center;
-            position: relative;
-        }
-        
-        .hero-logo {
-            width: 120px;
-            height: 120px;
-            border-radius: 25px;
-            box-shadow: 0 10px 40px rgba(251, 152, 51, 0.4);
-            margin-bottom: 30px;
-            animation: pulse 2s ease-in-out infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.05); }
-        }
-        
-        .hero h1 {
-            font-size: 4em;
-            font-weight: 800;
-            letter-spacing: 3px;
-            margin-bottom: 20px;
-            background: linear-gradient(45deg, var(--primary-orange), var(--primary-light));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        
-        .hero p {
-            font-size: 1.5em;
-            color: var(--primary-orange);
-            font-weight: 600;
-            margin-bottom: 40px;
-            letter-spacing: 2px;
-        }
-        
-        .hero-buttons {
-            display: flex;
-            gap: 20px;
-            flex-wrap: wrap;
-            justify-content: center;
-            margin-bottom: 40px;
-        }
-        
-        .hero-btn {
-            background: linear-gradient(45deg, var(--primary-orange), #FF6B35);
-            color: var(--primary-dark);
-            font-weight: 800;
-            font-size: 1.2em;
-            border: none;
-            padding: 18px 35px;
-            border-radius: 30px;
-            cursor: pointer;
-            box-shadow: 0 8px 25px rgba(251, 152, 51, 0.4);
-            transition: all 0.3s ease;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-        }
-        
-        .hero-btn:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 35px rgba(251, 152, 51, 0.6);
-        }
-        
-        .hero-btn.secondary {
-            background: transparent;
-            color: var(--primary-light);
-            border: 2px solid var(--primary-orange);
-        }
-        
-        .hero-btn.secondary:hover {
-            background: var(--primary-orange);
-            color: var(--primary-dark);
-        }
-        
-        .stats {
-            display: flex;
-            justify-content: center;
-            gap: 40px;
-            margin: 40px 0;
-            flex-wrap: wrap;
-        }
-        
-        .stat-item {
-            text-align: center;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 20px 25px;
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(251, 152, 51, 0.3);
-        }
-        
-        .stat-number {
-            font-size: 2.5em;
-            font-weight: 800;
-            color: var(--primary-orange);
-            display: block;
-        }
-        
-        .stat-label {
-            font-size: 0.9em;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-top: 5px;
-        }
-        
-        .main-content {
-            background: var(--primary-light);
-            color: var(--primary-dark);
-            padding: 80px 0;
-            margin-top: 50px;
-            border-radius: 50px 50px 0 0;
-            box-shadow: 0 -10px 50px rgba(1, 37, 56, 0.3);
-            position: relative;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 20px;
-        }
-        
-        .section-title {
-            text-align: center;
-            font-size: 3em;
-            color: var(--primary-dark);
-            margin-bottom: 60px;
-            font-weight: 800;
-            position: relative;
-        }
-        
-        .section-title::after {
-            content: "";
-            position: absolute;
-            bottom: -15px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 100px;
-            height: 4px;
-            background: linear-gradient(45deg, var(--primary-orange), var(--primary-teal));
-            border-radius: 2px;
-        }
-        
-        .projects-section {
-            margin: 80px 0;
-        }
-        
-        .projects-controls {
-            display: flex;
-            justify-content: center;
-            gap: 15px;
-            margin-bottom: 40px;
-            flex-wrap: wrap;
-        }
-        
-        .filter-btn {
-            background: transparent;
-            border: 2px solid var(--primary-teal);
-            color: var(--primary-teal);
-            padding: 10px 20px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-weight: 600;
-            transition: all 0.3s ease;
-        }
-        
-        .filter-btn:hover,
-        .filter-btn.active {
-            background: var(--primary-teal);
-            color: var(--primary-light);
-            transform: translateY(-2px);
-        }
-        
-        .projects-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 30px;
-            margin-top: 40px;
-        }
-        
-        .project-card {
-            background: white;
-            border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-            transition: all 0.3s ease;
-            border: 2px solid transparent;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .project-card:hover {
-            transform: translateY(-10px);
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15);
-            border-color: var(--primary-orange);
-        }
-        
-        .project-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 20px;
-        }
-        
-        .project-title {
-            font-size: 1.4em;
-            font-weight: 800;
-            color: var(--primary-dark);
-            margin-bottom: 10px;
-        }
-        
-        .project-funding {
-            background: linear-gradient(45deg, var(--success-green), #06B6D4);
-            color: white;
-            padding: 8px 15px;
-            border-radius: 20px;
-            font-weight: 700;
-            font-size: 0.9em;
-        }
-        
-        .project-description {
-            color: var(--primary-gray);
-            line-height: 1.6;
-            margin-bottom: 20px;
-            font-size: 1em;
-        }
-        
-        .project-team {
-            margin-bottom: 20px;
-        }
-        
-        .team-label {
-            font-weight: 600;
-            color: var(--primary-teal);
-            margin-bottom: 8px;
-            display: block;
-        }
-        
-        .team-members {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        
-        .team-member {
-            background: var(--primary-light);
-            color: var(--primary-dark);
-            padding: 5px 12px;
-            border-radius: 15px;
-            font-size: 0.9em;
-            font-weight: 500;
-        }
-        
-        .project-actions {
-            display: flex;
-            gap: 10px;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .vote-btn {
-            background: var(--primary-orange);
-            color: white;
-            border: none;
-            padding: 12px 20px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .vote-btn:hover {
-            background: #e8873d;
-            transform: scale(1.05);
-        }
-        
-        .vote-btn.voted {
-            background: var(--success-green);
-        }
-        
-        .vote-count {
-            font-weight: 800;
-            color: var(--primary-teal);
-            font-size: 1.1em;
-        }
-        
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 30px;
-            margin-top: 60px;
-        }
-        
-        .feature-card {
-            background: linear-gradient(135deg, var(--primary-gray), #374151);
-            color: var(--primary-light);
-            border-radius: 25px;
-            padding: 35px 25px;
-            text-align: center;
-            transition: all 0.4s ease;
-            cursor: pointer;
-        }
-        
-        .feature-card:hover {
-            transform: translateY(-15px);
-            box-shadow: 0 25px 50px rgba(251, 152, 51, 0.3);
-        }
-        
-        .feature-icon {
-            font-size: 3.5rem;
-            margin-bottom: 20px;
-        }
-        
-        .feature-title {
-            font-weight: 700;
-            color: var(--primary-orange);
-            font-size: 1.3em;
-            margin-bottom: 15px;
-        }
-        
-        .feature-description {
-            line-height: 1.6;
-        }
-        
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(10px);
-            z-index: 1000;
-        }
-        
-        .modal-content {
-            background: white;
-            margin: 5% auto;
-            padding: 40px;
-            width: 90%;
-            max-width: 600px;
-            border-radius: 25px;
-            position: relative;
-        }
-        
-        .close {
-            position: absolute;
-            top: 15px;
-            right: 20px;
-            font-size: 30px;
-            cursor: pointer;
-            color: var(--primary-gray);
-        }
-        
-        .close:hover {
-            color: var(--primary-orange);
-        }
-        
-        .modal h2 {
-            color: var(--primary-dark);
-            margin-bottom: 20px;
-            font-size: 2em;
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: var(--primary-dark);
-        }
-        
-        .form-group input,
-        .form-group textarea,
-        .form-group select {
-            width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #e5e5e5;
-            border-radius: 10px;
-            font-family: inherit;
-            font-size: 1em;
-            transition: border-color 0.3s ease;
-        }
-        
-        .form-group input:focus,
-        .form-group textarea:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: var(--primary-orange);
-        }
-        
-        .submit-btn {
-            background: linear-gradient(45deg, var(--primary-orange), var(--primary-teal));
-            color: white;
-            border: none;
-            padding: 15px 30px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 1.1em;
-            width: 100%;
-            transition: transform 0.3s ease;
-        }
-        
-        .submit-btn:hover {
-            transform: translateY(-2px);
-        }
-        
-        .toast {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: var(--success-green);
-            color: white;
-            padding: 15px 25px;
-            border-radius: 10px;
-            font-weight: 600;
-            z-index: 1001;
-            transform: translateX(400px);
-            transition: transform 0.3s ease;
-        }
-        
-        .toast.show {
-            transform: translateX(0);
-        }
-        
-        .toast.error {
-            background: #EF4444;
-        }
-        
-        .toast.info {
-            background: var(--primary-teal);
-        }
-        
-        footer {
-            background: linear-gradient(135deg, var(--primary-dark), #0F172A);
-            color: var(--primary-light);
-            text-align: center;
-            padding: 60px 20px 40px;
-            margin-top: 80px;
-            border-top: 3px solid var(--primary-teal);
-        }
-        
-        .footer-content {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        .footer-logo {
-            width: 80px;
-            height: 80px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-        }
-        
-        .footer-links {
-            display: flex;
-            justify-content: center;
-            gap: 30px;
-            margin: 30px 0;
-            flex-wrap: wrap;
-        }
-        
-        .footer-links a {
-            color: var(--primary-orange);
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            padding: 10px 20px;
-            border-radius: 20px;
-        }
-        
-        .footer-links a:hover {
-            background: rgba(251, 152, 51, 0.1);
-            transform: translateY(-2px);
-        }
-        
-        .badge {
-            display: inline-block;
-            background: var(--success-green);
-            color: white;
-            padding: 6px 12px;
-            border-radius: 15px;
-            font-weight: 700;
-            font-size: 0.8em;
-            margin-left: 10px;
-            text-transform: uppercase;
-        }
-        
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,.3);
-            border-radius: 50%;
-            border-top-color: #fff;
-            animation: spin 1s ease-in-out infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        @media (max-width: 768px) {
-            header {
-                padding: 15px 20px;
-                flex-direction: column;
-                gap: 15px;
-            }
-            
-            nav {
-                gap: 15px;
-                flex-wrap: wrap;
-                justify-content: center;
-            }
-            
-            .hero h1 {
-                font-size: 2.5em;
-            }
-            
-            .hero-buttons {
-                flex-direction: column;
-                align-items: center;
-            }
-            
-            .stats {
-                flex-direction: column;
-                align-items: center;
-            }
-            
-            .projects-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .features {
-                grid-template-columns: 1fr;
-            }
-            
-            .modal-content {
-                margin: 10% auto;
-                padding: 20px;
-            }
-        }
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PitchZone - Súbelo. Preséntalo. Véndelo.</title>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+<style>
+:root{--primary-orange:#FB9833;--primary-light:#FCEFEF;--primary-teal:#1B768E;--primary-dark:#012538;--primary-gray:#4D555B;--success-green:#10B981;--warning-yellow:#F59E0B}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Montserrat",Arial,sans-serif;background:linear-gradient(135deg,var(--primary-dark),var(--primary-teal));color:var(--primary-light);min-height:100vh;overflow-x:hidden}
+header{background:rgba(1,37,56,.95);backdrop-filter:blur(10px);padding:15px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid var(--primary-teal);position:sticky;top:0;z-index:100;transition:.3s}
+.logo-zone{display:flex;align-items:center;gap:15px;cursor:pointer;transition:.3s}
+.logo-zone img{height:45px;border-radius:12px;box-shadow:0 0 20px rgba(251,152,51,.5)}
+.logo-zone span{font-weight:800;font-size:1.8em;letter-spacing:2px;background:linear-gradient(45deg,var(--primary-orange),var(--primary-teal));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+nav{display:flex;gap:22px}
+nav a{color:var(--primary-light);text-decoration:none;font-weight:600;letter-spacing:1px;padding:8px 14px;border-radius:18px;transition:.2s}
+nav a:hover{color:var(--primary-orange);background:rgba(251,152,51,.12)}
+.hero{display:flex;flex-direction:column;align-items:center;padding:80px 20px 60px;text-align:center}
+.hero-logo{width:120px;height:120px;border-radius:25px;box-shadow:0 10px 40px rgba(251,152,51,.4);margin-bottom:30px}
+.hero h1{font-size:3.6em;font-weight:800;margin-bottom:10px;background:linear-gradient(45deg,var(--primary-orange),#fff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{font-size:1.2em;color:var(--primary-orange);font-weight:600;margin-bottom:30px}
+.hero-buttons{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-bottom:20px}
+.hero-btn{background:linear-gradient(45deg,var(--primary-orange),#FF6B35);color:var(--primary-dark);font-weight:800;border:none;padding:14px 26px;border-radius:26px;cursor:pointer;box-shadow:0 8px 25px rgba(251,152,51,.35)}
+.hero-btn.secondary{background:transparent;color:#fff;border:2px solid var(--primary-orange)}
+.stats{display:flex;justify-content:center;gap:30px;margin:30px 0;flex-wrap:wrap}
+.stat-item{text-align:center;background:rgba(255,255,255,.08);padding:14px 16px;border-radius:12px;border:1px solid rgba(251,152,51,.3)}
+.stat-number{font-size:2em;font-weight:800;color:var(--primary-orange)}
+.main-content{background:var(--primary-light);color:var(--primary-dark);padding:60px 0;margin-top:40px;border-radius:38px 38px 0 0;box-shadow:0 -10px 40px rgba(1,37,56,.3)}
+.container{max-width:1200px;margin:0 auto;padding:0 20px}
+.section-title{text-align:center;font-size:2.4em;margin-bottom:34px;font-weight:800;color:var(--primary-dark);position:relative}
+.section-title:after{content:"";position:absolute;bottom:-12px;left:50%;transform:translateX(-50%);width:90px;height:4px;background:linear-gradient(45deg,var(--primary-orange),var(--primary-teal));border-radius:2px}
+.projects-section{margin:60px 0}
+.projects-controls{display:flex;justify-content:center;gap:12px;margin-bottom:22px;flex-wrap:wrap}
+.filter-btn{background:transparent;border:2px solid var(--primary-teal);color:var(--primary-teal);padding:8px 16px;border-radius:22px;cursor:pointer;font-weight:600}
+.filter-btn.active,.filter-btn:hover{background:var(--primary-teal);color:#fff}
+.projects-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:22px}
+.project-card{background:#fff;border-radius:18px;padding:22px;border:2px solid transparent;box-shadow:0 8px 22px rgba(0,0,0,.08);transition:.2s}
+.project-card:hover{transform:translateY(-6px);border-color:var(--primary-orange)}
+.project-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
+.project-title{font-size:1.25em;font-weight:800;color:var(--primary-dark)}
+.project-funding{background:linear-gradient(45deg,var(--success-green),#06B6D4);color:#fff;padding:6px 12px;border-radius:16px;font-weight:700;font-size:.85em}
+.project-description{color:var(--primary-gray);line-height:1.55;margin-bottom:10px}
+.team-label{font-weight:700;color:var(--primary-teal);margin-bottom:6px;display:block}
+.team-members{display:flex;flex-wrap:wrap;gap:6px}
+.team-member{background:var(--primary-light);color:var(--primary-dark);padding:4px 10px;border-radius:14px;font-size:.85em}
+.vote-btn{background:var(--primary-orange);color:#fff;border:none;padding:10px 16px;border-radius:20px;cursor:pointer;font-weight:700}
+.vote-count{font-weight:800;color:var(--primary-teal)}
+footer{background:linear-gradient(135deg,var(--primary-dark),#0F172A);color:#fff;text-align:center;padding:48px 20px;margin-top:60px;border-top:3px solid var(--primary-teal)}
+.footer-links{display:flex;justify-content:center;gap:24px;margin:18px 0;flex-wrap:wrap}
+.badge{display:inline-block;background:var(--success-green);color:#fff;padding:6px 10px;border-radius:14px;font-weight:800;font-size:.8em;margin-left:8px}
+
+/* Pill badge eventos */
+.pill-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75em;font-weight:800;background:var(--success-green);color:#fff;margin-left:8px;box-shadow:0 2px 10px rgba(16,185,129,.35);vertical-align:middle}
+.pill-badge.warn{background:#F59E0B;box-shadow:0 2px 10px rgba(245,158,11,.35)}
+
+/* 🚀 Rocket */
+.rocket-fx{position:fixed;left:-80px;top:60%;transform:translate(-50%,-50%) rotate(-20deg);font-size:64px;line-height:1;z-index:9999;filter:drop-shadow(0 8px 16px rgba(0,0,0,.35));pointer-events:none;animation:rocketFly 1.6s ease-in forwards}
+@keyframes rocketFly{0%{transform:translate(-50%,-50%) rotate(-20deg)}40%{transform:translate(40vw,-55vh) rotate(-10deg)}70%{transform:translate(70vw,-25vh) rotate(0deg)}100%{transform:translate(110vw,-80vh) rotate(8deg)}}
+.rocket-fx::after{content:"🔥";position:absolute;right:-14px;top:26px;font-size:28px;filter:blur(.4px);animation:flame .2s infinite alternate}
+@keyframes flame{from{transform:translateY(0) scale(1);opacity:.9}to{transform:translateY(3px) scale(.9);opacity:.6}}
+
+@media(max-width:768px){header{padding:14px 16px;flex-direction:column;gap:10px}}
+</style>
 </head>
 <body>
-    <header>
-        <div class="logo-zone" onclick="scrollToTop()">
-            <img src="logo_pitchzone.png" alt="PitchZone Logo">
-            <span>PITCHZONE</span>
-            <span id="dbBadge" class="badge" style="display:none;">Cargando...</span>
-        </div>
-        <nav>
-            <a href="#inicio" onclick="scrollToSection('inicio')"><i class="fas fa-home"></i> Inicio</a>
-            <a href="#proyectos" onclick="scrollToSection('proyectos')"><i class="fas fa-rocket"></i> Proyectos</a>
-            <a href="#caracteristicas" onclick="scrollToSection('caracteristicas')"><i class="fas fa-star"></i> Características</a>
-            <a href="#contacto" onclick="scrollToSection('contacto')"><i class="fas fa-envelope"></i> Contacto</a>
-        </nav>
-    </header>
+<header>
+  <div class="logo-zone" onclick="window.scrollTo({top:0,behavior:'smooth'})">
+    <img src="logo_pitchzone.png" alt="PitchZone" onerror="this.style.display='none'">
+    <span>PITCHZONE</span>
+    <span id="dbBadge" class="badge" style="display:none;">Cargando...</span>
+  </div>
+  <nav>
+    <a href="#inicio"><i class="fas fa-home"></i> Inicio</a>
+    <a href="#proyectos"><i class="fas fa-rocket"></i> Proyectos</a>
+    <a href="#alianzas"><i class="fas fa-handshake"></i> Alianzas</a>
+    <a href="#eventos"><i class="fas fa-calendar"></i> Eventos</a>
+    <a href="#contacto"><i class="fas fa-envelope"></i> Contacto</a>
+  </nav>
+</header>
 
-    <section class="hero" id="inicio">
-        <img src="logo_pitchzone.png" alt="PitchZone Logo" class="hero-logo">
-        <h1>PITCHZONE</h1>
-        <p>"Súbelo. Preséntalo. Véndelo."</p>
-        
-        <div class="hero-buttons">
-            <button class="hero-btn" onclick="openModal('uploadModal')">
-                <i class="fas fa-upload"></i> ¡Sube tu proyecto!
-            </button>
-            <button class="hero-btn secondary" onclick="scrollToSection('proyectos')">
-                <i class="fas fa-eye"></i> Ver Proyectos
-            </button>
-        </div>
-        
-        <div class="stats">
-            <div class="stat-item">
-                <span class="stat-number" id="totalProjects">0</span>
-                <span class="stat-label">Proyectos</span>
-            </div>
-            <div class="stat-item">
-                <span class="stat-number" id="totalFunding">$0</span>
-                <span class="stat-label">Funding Total</span>
-            </div>
-            <div class="stat-item">
-                <span class="stat-number" id="totalVotes">0</span>
-                <span class="stat-label">Votos</span>
-            </div>
-        </div>
-        
-        <div id="dbInfo" style="margin-top:20px;font-weight:700;"></div>
-    </section>
+<section class="hero" id="inicio">
+  <img class="hero-logo" src="logo_pitchzone.png" alt="" onerror="this.style.display='none'">
+  <h1>PITCHZONE</h1>
+  <p>"Súbelo. Preséntalo. Véndelo."</p>
+  <div class="hero-buttons">
+    <button class="hero-btn" onclick="openModal('uploadModal')"><i class="fas fa-upload"></i> ¡Sube tu proyecto!</button>
+    <button class="hero-btn secondary" onclick="document.getElementById('proyectos').scrollIntoView({behavior:'smooth'})"><i class="fas fa-eye"></i> Ver Proyectos</button>
+  </div>
+  <div class="stats">
+    <div class="stat-item"><span class="stat-number" id="totalProjects">0</span><div class="stat-label">Proyectos</div></div>
+    <div class="stat-item"><span class="stat-number" id="totalFunding">$0</span><div class="stat-label">Funding Total</div></div>
+    <div class="stat-item"><span class="stat-number" id="totalVotes">0</span><div class="stat-label">Votos</div></div>
+  </div>
+  <div id="dbInfo" style="margin-top:10px;font-weight:700;"></div>
+</section>
 
-    <div class="main-content" id="caracteristicas">
-        <div class="container">
-            <h2 class="section-title">¿Qué puedes hacer en PitchZone?</h2>
-            <div class="features">
-                <div class="feature-card" onclick="animateFeature(this)">
-                    <div class="feature-icon">🎬</div>
-                    <div class="feature-title">Reels de Proyectos</div>
-                    <div class="feature-description">Muestra tu pitch en video y destaca ante inversores con presentaciones impactantes.</div>
-                </div>
-                <div class="feature-card" onclick="animateFeature(this)">
-                    <div class="feature-icon">🏫</div>
-                    <div class="feature-title">Alianzas Universitarias</div>
-                    <div class="feature-description">Difunde tu proyecto con el apoyo de universidades e incubadoras reconocidas.</div>
-                </div>
-                <div class="feature-card" onclick="animateFeature(this)">
-                    <div class="feature-icon">🚀</div>
-                    <div class="feature-title">Demo Day y Eventos</div>
-                    <div class="feature-description">Participa en concursos y presentaciones virtuales con networking exclusivo.</div>
-                </div>
-                <div class="feature-card" onclick="animateFeature(this)">
-                    <div class="feature-icon">💡</div>
-                    <div class="feature-title">Proyectos Olvidados</div>
-                    <div class="feature-description">Revive y publica ideas que merecen una segunda oportunidad en el mercado.</div>
-                </div>
-            </div>
-        </div>
+<div class="main-content">
+  <div class="container">
+    <h2 class="section-title" id="caracteristicas">¿Qué puedes hacer en PitchZone?</h2>
+    <div class="projects-controls" style="gap:16px;flex-wrap:wrap;justify-content:center">
+      <div class="project-card" onclick="animateFeature(this)"><div class="project-header"><div><h3 class="project-title">🎬 Reels de Proyectos</h3></div></div><p class="project-description">Muestra tu pitch en video y destaca ante inversores.</p></div>
+      <div class="project-card" onclick="animateFeature(this)"><div class="project-header"><div><h3 class="project-title">🏫 Alianzas Universitarias</h3></div></div><p class="project-description">Difunde tu proyecto con el apoyo de universidades.</p></div>
+      <div class="project-card" onclick="openEvents()" id="demoDayCard"><div class="project-header"><div><h3 class="project-title">🚀 Demo Day y Eventos <span id="eventsBadge" class="pill-badge" style="display:none;">0</span></h3></div></div><p class="project-description">Presentaciones, concursos y networking exclusivo.</p></div>
+      <div class="project-card" onclick="animateFeature(this)"><div class="project-header"><div><h3 class="project-title">💡 Proyectos Olvidados</h3></div></div><p class="project-description">Revive y publica ideas con potencial.</p></div>
     </div>
+  </div>
+</div>
 
-    <section class="projects-section" id="proyectos">
-        <div class="container">
-            <h2 class="section-title">Proyectos Destacados</h2>
-            
-            <div class="projects-controls">
-                <button class="filter-btn active" onclick="filterProjects('all')">Todos</button>
-                <button class="filter-btn" onclick="filterProjects('tech')">Tecnología</button>
-                <button class="filter-btn" onclick="filterProjects('social')">Social</button>
-                <button class="filter-btn" onclick="filterProjects('eco')">Ecología</button>
-                <button class="filter-btn" onclick="filterProjects('health')">Salud</button>
-                <button class="filter-btn" onclick="filterProjects('education')">Educación</button>
-            </div>
-            
-            <div class="projects-grid" id="projectsGrid">
-                <!-- Los proyectos se cargarán dinámicamente -->
-            </div>
-        </div>
-    </section>
-
-    <footer id="contacto">
-        <div class="footer-content">
-            <img src="logo_pitchzone.png" alt="PitchZone Logo" class="footer-logo">
-            <div>
-                <h3 style="margin-bottom: 15px; font-size: 1.5em;">PitchZone</h3>
-                <p style="margin-bottom: 20px;">"Súbelo. Preséntalo. Véndelo."</p>
-                <p style="color: var(--primary-orange); font-weight: 600; font-size: 1.1em;">contacto@pitchzone.com</p>
-            </div>
-            
-            <div class="footer-links">
-                <a href="#" onclick="showToast('Instagram próximamente disponible', 'info')"><i class="fab fa-instagram"></i> Instagram</a>
-                <a href="#" onclick="showToast('LinkedIn próximamente disponible', 'info')"><i class="fab fa-linkedin"></i> LinkedIn</a>
-                <a href="#" onclick="showToast('YouTube próximamente disponible', 'info')"><i class="fab fa-youtube"></i> YouTube</a>
-                <a href="#" onclick="openModal('contactModal')"><i class="fas fa-envelope"></i> Contacto</a>
-            </div>
-            
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid rgba(251, 152, 51, 0.3);">
-                <p style="font-size: 0.9em; color: rgba(252, 239, 239, 0.7);">
-                    © 2025 PitchZone. Todos los derechos reservados. | Desplegado en AWS EC2
-                </p>
-            </div>
-        </div>
-    </footer>
-
-    <!-- Modal para subir proyecto -->
-    <div id="uploadModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeModal('uploadModal')">&times;</span>
-            <h2><i class="fas fa-rocket"></i> Sube tu Proyecto</h2>
-            <form id="uploadForm" onsubmit="submitProject(event)">
-                <div class="form-group">
-                    <label for="projectName">Nombre del Proyecto *</label>
-                    <input type="text" id="projectName" required placeholder="Ej: EcoSmart Delivery">
-                </div>
-                <div class="form-group">
-                    <label for="projectDescription">Descripción del Proyecto *</label>
-                    <textarea id="projectDescription" rows="4" required placeholder="Describe tu proyecto de manera clara y atractiva..."></textarea>
-                </div>
-                <div class="form-group">
-                    <label for="teamMembers">Integrantes del Equipo *</label>
-                    <input type="text" id="teamMembers" required placeholder="Juan Pérez, María García, Carlos López">
-                    <small style="color: #666;">Separa los nombres con comas</small>
-                </div>
-                <div class="form-group">
-                    <label for="fundingAmount">Funding Necesario (USD) *</label>
-                    <input type="number" id="fundingAmount" min="1000" max="1000000" required placeholder="25000">
-                </div>
-                <div class="form-group">
-                    <label for="projectCategory">Categoría *</label>
-                    <select id="projectCategory" required>
-                        <option value="">Selecciona una categoría</option>
-                        <option value="tech">Tecnología</option>
-                        <option value="social">Social</option>
-                        <option value="eco">Ecología</option>
-                        <option value="health">Salud</option>
-                        <option value="education">Educación</option>
-                        <option value="finance">Finanzas</option>
-                    </select>
-                </div>
-                <button type="submit" class="submit-btn">
-                    <i class="fas fa-paper-plane"></i> Enviar Proyecto
-                </button>
-            </form>
-        </div>
+<section class="projects-section" id="proyectos">
+  <div class="container">
+    <h2 class="section-title">Proyectos Destacados</h2>
+    <div class="projects-controls">
+      <button class="filter-btn active" onclick="filterProjects('all', this)">Todos</button>
+      <button class="filter-btn" onclick="filterProjects('tech', this)">Tecnología</button>
+      <button class="filter-btn" onclick="filterProjects('social', this)">Social</button>
+      <button class="filter-btn" onclick="filterProjects('eco', this)">Ecología</button>
+      <button class="filter-btn" onclick="filterProjects('health', this)">Salud</button>
+      <button class="filter-btn" onclick="filterProjects('education', this)">Educación</button>
     </div>
+    <div class="projects-grid" id="projectsGrid"></div>
+  </div>
+</section>
 
-    <!-- Modal de contacto -->
-    <div id="contactModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeModal('contactModal')">&times;</span>
-            <h2><i class="fas fa-envelope"></i> Contáctanos</h2>
-            <form id="contactForm" onsubmit="submitContact(event)">
-                <div class="form-group">
-                    <label for="contactName">Nombre *</label>
-                    <input type="text" id="contactName" required placeholder="Tu nombre">
-                </div>
-                <div class="form-group">
-                    <label for="contactEmail">Email *</label>
-                    <input type="email" id="contactEmail" required placeholder="tu@email.com">
-                </div>
-                <div class="form-group">
-                    <label for="contactSubject">Asunto *</label>
-                    <input type="text" id="contactSubject" required placeholder="Consulta sobre PitchZone">
-                </div>
-                <div class="form-group">
-                    <label for="contactMessage">Mensaje *</label>
-                    <textarea id="contactMessage" rows="5" required placeholder="Escribe tu mensaje aquí..."></textarea>
-                </div>
-                <button type="submit" class="submit-btn">
-                    <i class="fas fa-paper-plane"></i> Enviar Mensaje
-                </button>
-            </form>
-        </div>
+<section class="projects-section" id="alianzas">
+  <div class="container">
+    <h2 class="section-title">Alianzas Universitarias</h2>
+    <div class="projects-controls" style="gap:12px;align-items:center">
+      <span style="font-weight:700;color:#1B768E">Total:</span>
+      <span id="alliancesCount" style="font-weight:800">0</span>
+      <select id="alliancesFilter" class="filter-btn" onchange="renderAlliances()">
+        <option value="all">Todas</option>
+        <option value="Pública">Públicas</option>
+        <option value="Privada">Privadas</option>
+      </select>
     </div>
+    <div class="projects-grid" id="alliancesGrid"></div>
+  </div>
+</section>
 
-    <!-- Toast notifications -->
-    <div id="toast" class="toast"></div>
+<section class="projects-section" id="eventos">
+  <div class="container">
+    <h2 class="section-title">Próximos Eventos</h2>
+    <div id="eventsInfo" style="text-align:center;margin-bottom:16px;color:#1B768E;font-weight:700;"></div>
+    <div class="projects-grid" id="eventsGrid"></div>
+  </div>
+</section>
 
-    <script>
-        // Variables globales
-        let projectsData = [];
-        let currentFilter = 'all';
-        let projectVotes = {};
-        
-        // Categorías de proyectos
-        const projectCategories = {
-            'EcoSmart Delivery': 'eco',
-            'PetMatch': 'social',
-            'Exxxtasis': 'social',
-            'SmartWaste': 'eco',
-            'FitFinance': 'finance',
-            'EduPlay': 'education',
-            'AgroScan': 'tech',
-            'SaludYA': 'health',
-            'JobQuest': 'tech',
-            'CleanOcean': 'eco'
-        };
+<footer id="contacto">
+  <div class="footer-links">
+    <a href="#" onclick="showToast('Instagram próximamente', 'info')"><i class="fab fa-instagram"></i> Instagram</a>
+    <a href="#" onclick="showToast('LinkedIn próximamente', 'info')"><i class="fab fa-linkedin"></i> LinkedIn</a>
+    <a href="#" onclick="showToast('YouTube próximamente', 'info')"><i class="fab fa-youtube"></i> YouTube</a>
+  </div>
+  <p>© 2025 PitchZone • Desplegado en AWS EC2</p>
+</footer>
 
-        // Inicialización
-        document.addEventListener('DOMContentLoaded', function() {
-            console.log('🚀 Iniciando PitchZone...');
-            loadProjects();
-            initializeVotes();
-            setupEventListeners();
-            
-            // Mensaje de bienvenida
-            setTimeout(() => {
-                showToast('¡Bienvenido a PitchZone! 🎉', 'info');
-            }, 1000);
-        });
+<!-- Seeds (sed inyecta si existen archivos en /var/www/html) -->
+<script id="projectsSeed" type="application/json"><!--SEED-HERE--></script>
+<script id="universidadesSeed" type="application/json"><!--UNIVERSIDADES-SEED--></script>
+<script id="eventsSeed" type="application/json"><!--EVENTS-SEED--></script>
 
-        // Configurar event listeners
-        function setupEventListeners() {
-            // Smooth scrolling
-            document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-                anchor.addEventListener('click', function (e) {
-                    e.preventDefault();
-                    const target = document.querySelector(this.getAttribute('href'));
-                    if (target) {
-                        target.scrollIntoView({
-                            behavior: 'smooth',
-                            block: 'start'
-                        });
-                    }
-                });
-            });
+<script>
+// ========= CONFIG =========
+const API_BASE = "%%API_BASE%%";                 // ← se reemplaza por sed
+const API_PROJECTS = API_BASE + "/projects";
+// ==========================
 
-            // Header effect
-            window.addEventListener('scroll', function() {
-                const header = document.querySelector('header');
-                if (window.scrollY > 100) {
-                    header.style.background = 'rgba(1,37,56,0.98)';
-                    header.style.boxShadow = '0 2px 20px rgba(0,0,0,0.3)';
-                } else {
-                    header.style.background = 'rgba(1,37,56,0.95)';
-                    header.style.boxShadow = 'none';
-                }
-            });
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+window.addEventListener('scroll',()=>{const h=document.querySelector('header');h.style.background=window.scrollY>100?'rgba(1,37,56,.98)':'rgba(1,37,56,.95)'});
 
-            // Cerrar modal con Escape
-            document.addEventListener('keydown', function(e) {
-                if (e.key === 'Escape') {
-                    document.querySelectorAll('.modal').forEach(modal => {
-                        if (modal.style.display === 'block') {
-                            modal.style.display = 'none';
-                            document.body.style.overflow = 'auto';
-                        }
-                    });
-                }
-            });
+// ===== Proyectos =====
+let projectsData=[], currentFilter='all', projectVotes={};
+const projectCategories={'EcoSmart Delivery':'eco','PetMatch':'social','Exxxtasis':'social','SmartWaste':'eco','FitFinance':'finance','EduPlay':'education','AgroScan':'tech','SaludYA':'health','JobQuest':'tech','CleanOcean':'eco'};
 
-            // Cerrar modal clickeando fuera
-            window.addEventListener('click', function(event) {
-                if (event.target.classList.contains('modal')) {
-                    event.target.style.display = 'none';
-                    document.body.style.overflow = 'auto';
-                }
-            });
-        }
+document.addEventListener('DOMContentLoaded',async ()=>{
+  // Preferir backend (si existe)
+  await fetchProjectsFromApi().catch(()=>{});
+  if (!projectsData.length) loadProjects();  // fallback seed/archivo
+  loadUniversidades();
+  loadEvents(updateEventsBadge);
 
-        // Cargar proyectos
-        function loadProjects() {
-            console.log('📦 Cargando proyectos...');
-            
-            fetch('./proyectos.json', {cache: 'no-store'})
-                .then(r => r.ok ? r.json() : Promise.reject(r.status))
-                .then(data => {
-                    console.log('✅ Proyectos cargados desde JSON:', data.length);
-                    projectsData = data;
-                    updateStats();
-                    renderProjects();
-                    updateDbStatus(true, data.length);
-                })
-                .catch(err => {
-                    console.log('⚠️ No se encontró proyectos.json, usando datos de ejemplo');
-                    projectsData = getSampleProjects();
-                    updateStats();
-                    renderProjects();
-                    updateDbStatus(false, projectsData.length);
-                });
-        }
+  if (window.location.hash === '#eventos') setTimeout(openEvents, 500);
+  setTimeout(()=>showToast('¡Bienvenido a PitchZone! 🎉','info'),700);
+});
 
-        // Datos de ejemplo
-        function getSampleProjects() {
-            return [
-                {
-                    nombre_proyecto: "EcoSmart Delivery",
-                    descripcion: "Aplicación para optimizar rutas de entrega ecológicas usando inteligencia artificial.",
-                    integrantes: ["Ana Torres", "Luis Gómez", "María José"],
-                    funding_necesario: 25000
-                },
-                {
-                    nombre_proyecto: "PetMatch",
-                    descripcion: "Plataforma estilo Bumble para adoptar mascotas de forma interactiva.",
-                    integrantes: ["Julia Ríos", "Fer Sánchez", "Renata López"],
-                    funding_necesario: 18000
-                },
-                {
-                    nombre_proyecto: "SmartWaste",
-                    descripcion: "Sistema de recolección de basura inteligente con sensores IoT.",
-                    integrantes: ["Carlos Díaz", "Lucía Mendoza"],
-                    funding_necesario: 22000
-                }
-            ];
-        }
+async function fetchProjectsFromApi(){
+  if (!API_BASE || API_BASE.includes('%%API_BASE%%')) return; // aún no reemplazado
+  const r=await fetch(API_PROJECTS); const arr=await r.json(); if(!Array.isArray(arr)) return;
+  projectsData=arr.map(x=>({nombre_proyecto:x.nombre_proyecto,descripcion:x.descripcion,integrantes:x.integrantes||[],funding_necesario:Number(x.funding_necesario)||0,categoria:x.categoria||'tech'}));
+  updateStats(); renderProjects(); updateDbStatus(true,projectsData.length);
+}
 
-        // Inicializar votos (simulados)
-        function initializeVotes() {
-            // Crear votos aleatorios para demo
-            projectsData.forEach(project => {
-                if (!projectVotes[project.nombre_proyecto]) {
-                    projectVotes[project.nombre_proyecto] = Math.floor(Math.random() * 50) + 5;
-                }
-            });
-        }
+function loadProjects(){
+  const seed=document.getElementById('projectsSeed'); 
+  try{const t=(seed&&seed.textContent||'').trim(); if(t.startsWith('[')){projectsData=JSON.parse(t); updateStats(); renderProjects(); updateDbStatus(true,projectsData.length); return;}}catch{}
+  fetch('./proyectos.json?t='+Date.now(),{cache:'no-store'})
+    .then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{projectsData=d; updateStats(); renderProjects(); updateDbStatus(true,d.length);})
+    .catch(()=>{projectsData=getSampleProjects(); updateStats(); renderProjects(); updateDbStatus(false,projectsData.length);});
+}
+function getSampleProjects(){return[
+ {nombre_proyecto:"EcoSmart Delivery",descripcion:"Optimiza rutas con IA.",integrantes:["Ana","Luis","María"],funding_necesario:25000},
+ {nombre_proyecto:"PetMatch",descripcion:"Adopción interactiva.",integrantes:["Julia","Fer","Renata"],funding_necesario:18000},
+ {nombre_proyecto:"SmartWaste",descripcion:"IoT para recolección inteligente.",integrantes:["Carlos","Lucía"],funding_necesario:22000}
+];}
+function initializeVotes(){projectsData.forEach(p=>{if(!projectVotes[p.nombre_proyecto])projectVotes[p.nombre_proyecto]=Math.floor(Math.random()*50)+5;});}
+function updateStats(){initializeVotes();const tp=projectsData.length;const tf=projectsData.reduce((s,p)=>s+Number(p.funding_necesario||0),0);const tv=Object.values(projectVotes).reduce((s,v)=>s+v,0);animate('totalProjects',tp);animate('totalFunding',tf,true);animate('totalVotes',tv);}
+function animate(id,val,money=false){const el=document.getElementById(id);const t0=performance.now(),d=900;const from=0;function step(t){const k=Math.min((t-t0)/d,1);const v=Math.floor(from+(val-from)*k);el.textContent=money?('$'+v.toLocaleString()):v.toLocaleString();if(k<1)requestAnimationFrame(step);}requestAnimationFrame(step);}
+function renderProjects(){const grid=document.getElementById('projectsGrid');const list=currentFilter==='all'?projectsData:projectsData.filter(p=>projectCategories[p.nombre_proyecto]===currentFilter);grid.innerHTML=list.map(p=>`
+  <div class="project-card">
+    <div class="project-header"><div><h3 class="project-title">${escapeHtml(p.nombre_proyecto)}</h3></div>
+    <div class="project-funding">$${Number(p.funding_necesario||0).toLocaleString()}</div></div>
+    <p class="project-description">${escapeHtml(p.descripcion)}</p>
+    <div class="team-label"><i class="fas fa-users"></i> Equipo:</div>
+    <div class="team-members">${(p.integrantes||[]).map(n=>`<span class="team-member">${escapeHtml(n)}</span>`).join('')}</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">
+      <button class="vote-btn" onclick="voteProject('${p.nombre_proyecto.replace(/'/g,"\\'")}')"><i class="fas fa-thumbs-up"></i> Votar</button>
+      <span class="vote-count"><i class="fas fa-heart"></i> ${projectVotes[p.nombre_proyecto]||0}</span>
+    </div>
+  </div>`).join('');}
+function voteProject(name){projectVotes[name]=(projectVotes[name]||0)+1;updateStats();renderProjects();showToast('¡Voto registrado! 🎉','success');}
+function filterProjects(cat,btn){currentFilter=cat;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');renderProjects();}
+function updateDbStatus(ok,count){const b=document.getElementById('dbBadge'),i=document.getElementById('dbInfo');b.style.display='inline-block';if(ok){b.textContent='DB: '+count+' proyectos';b.style.background='var(--success-green)';i.innerHTML='📊 Base de datos conectada • <span style="color:var(--primary-orange)">'+count+' proyectos</span>';}else{b.textContent='DEMO';b.style.background='var(--warning-yellow)';b.style.color='var(--primary-dark)';i.innerHTML='🔧 Modo demostración';}}
 
-        // Actualizar estadísticas
-        function updateStats() {
-            const totalProjects = projectsData.length;
-            const totalFunding = projectsData.reduce((sum, p) => sum + p.funding_necesario, 0);
-            const totalVotes = Object.values(projectVotes).reduce((sum, votes) => sum + votes, 0);
+// ===== Universidades =====
+let universidadesData=[];
+function loadUniversidades(){
+  const seed=document.getElementById('universidadesSeed');
+  try{const t=(seed&&seed.textContent||'').trim(); if(t){const obj=JSON.parse(t); universidadesData=Array.isArray(obj)?obj:(Array.isArray(obj.alianzas_universitarias)?obj.alianzas_universitarias:[]); if(universidadesData.length){renderAlliances(); return;}}}catch{}
+  fetch('./universidades.json?t='+Date.now(),{cache:'no-store'})
+    .then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(obj=>{universidadesData=Array.isArray(obj)?obj:(Array.isArray(obj.alianzas_universitarias)?obj.alianzas_universitarias:[]);renderAlliances();})
+    .catch(()=>{universidadesData=[{id:0,nombre:"Universidad Demo",siglas:"DEMO",tipo:"Pública",ubicacion:"Ciudad Demo",sitio_web:"https://example.com"}];renderAlliances();});
+}
+function renderAlliances(){
+  const grid=document.getElementById('alliancesGrid'),count=document.getElementById('alliancesCount'),sel=document.getElementById('alliancesFilter');
+  const filtro=sel?sel.value:'all'; let data=universidadesData.slice();
+  if(filtro!=='all') data=data.filter(a=>(a.tipo||'').toLowerCase()===filtro.toLowerCase());
+  count.textContent=data.length;
+  grid.innerHTML=data.map(a=>`
+    <div class="project-card">
+      <div class="project-header">
+        <div><h3 class="project-title">${escapeHtml(a.nombre||a.siglas||'Universidad')}</h3>
+        <div style="color:#1B768E;font-weight:700">${escapeHtml(a.siglas||'')} ${a.tipo?'• '+escapeHtml(a.tipo):''} ${a.ubicacion?'• '+escapeHtml(a.ubicacion):''}</div></div>
+        ${a.sitio_web?`<a class="project-funding" href="${a.sitio_web}" target="_blank" rel="noopener">Sitio</a>`:''}
+      </div>
+      ${a.sitio_web?`<p class="project-description"><a href="${a.sitio_web}" target="_blank" rel="noopener">${escapeHtml(a.sitio_web)}</a></p>`:''}
+    </div>`).join('');
+}
 
-            animateNumber('totalProjects', totalProjects);
-            animateNumber('totalFunding', totalFunding, true);
-            animateNumber('totalVotes', totalVotes);
-        }
+// ===== Eventos =====
+let eventsData=[];
+function openEvents() {
+  const rocket=document.createElement('div'); rocket.className='rocket-fx'; rocket.textContent='🚀'; document.body.appendChild(rocket);
+  const go=()=>{rocket.addEventListener('animationend',()=>{rocket.remove();document.getElementById('eventos').scrollIntoView({behavior:'smooth'});showToast('Mostrando próximos eventos 🚀','info');},{once:true});};
+  if (!eventsData.length) loadEvents(()=>{updateEventsBadge();go();}); else {updateEventsBadge();go();}
+}
+function loadEvents(done){
+  const seed=document.getElementById('eventsSeed');
+  try{const txt=(seed&&seed.textContent||'').trim(); if(txt){const o=txt.startsWith('[')?JSON.parse(txt):JSON.parse(txt); eventsData=normalizeEvents(o); renderEvents(); updateEventsBadge(); if(done)done(); return;}}catch(e){}
+  fetch('./eventos.json?t='+Date.now(),{cache:'no-store'})
+    .then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{eventsData=normalizeEvents(d); renderEvents(); updateEventsBadge(); if(done)done();})
+    .catch(()=>{eventsData=[{titulo:"PitchZone Demo Day LATAM",fecha:proxDia(7),hora:"18:00",modalidad:"Online",descripcion:"Presenta tu pitch a mentores e inversionistas.",registro_url:"#"},
+                           {titulo:"Taller: Storytelling para Pitches",fecha:proxDia(14),hora:"17:00",modalidad:"Híbrido",descripcion:"Estructura un pitch ganador en 60 minutos.",registro_url:"#"},
+                           {titulo:"Matchmaking Startups × Universidades",fecha:proxDia(21),hora:"19:00",modalidad:"Online",descripcion:"Conecta con universidades para alianzas y talento.",registro_url:"#"}];
+             renderEvents(); updateEventsBadge(); if(done)done();});
+}
+function normalizeEvents(o){if(Array.isArray(o))return o; if(Array.isArray(o.eventos))return o.eventos; return [];}
+function renderEvents(){const now=new Date();const up=eventsData.map(e=>({...e,_d:new Date(e.fecha||e.date||Date.now())})).filter(e=>!isNaN(e._d)&&e._d>=new Date(now.toDateString())).sort((a,b)=>a._d-b._d).slice(0,3);
+  const grid=document.getElementById('eventsGrid'),info=document.getElementById('eventsInfo'); info.textContent=up.length?`Mostrando ${up.length} próximos`:'Sin eventos próximos';
+  grid.innerHTML=up.map(e=>`<div class="project-card"><div class="project-header"><div><h3 class="project-title">${escapeHtml(e.titulo||'Evento')}</h3>
+  <div style="color:#1B768E;font-weight:700">${formatFecha(e._d)} ${e.hora?'• '+escapeHtml(e.hora):''} ${e.modalidad?'• '+escapeHtml(e.modalidad):''}</div></div>
+  ${e.registro_url?`<a class="project-funding" href="${e.registro_url}" target="_blank" rel="noopener">Registrarme</a>`:''}</div>
+  ${e.descripcion?`<p class="project-description">${escapeHtml(e.descripcion)}</p>`:''}</div>`).join('');}
+function formatFecha(d){try{return d.toLocaleDateString('es-MX',{weekday:'short',day:'2-digit',month:'short',year:'numeric'});}catch{return d.toISOString().slice(0,10);}}
+function proxDia(n){const d=new Date();d.setDate(d.getDate()+n);return d.toISOString().slice(0,10);}
+function upcomingCountFrom(data){const today=new Date(),mid=new Date(today.toDateString());return (data||[]).map(e=>new Date(e.fecha||e.date||e._d||Date.now())).filter(d=>!isNaN(d)&&d>=mid).length;}
+function updateEventsBadge(){const b=document.getElementById('eventsBadge'); if(!b)return; const c=upcomingCountFrom(eventsData); if(c>0){b.textContent=c;b.classList.remove('warn');b.style.display='inline-block';}else{b.textContent='0';b.classList.add('warn');b.style.display='inline-block';}}
 
-        // Animar números
-        function animateNumber(elementId, targetValue, isCurrency = false) {
-            const element = document.getElementById(elementId);
-            const startValue = 0;
-            const duration = 2000;
-            const startTime = performance.now();
+// ===== UI =====
+function openModal(id){const m=document.getElementById(id); if(!m) return; m.style.display='block'; document.body.style.overflow='hidden';}
+function showToast(msg,type='success'){const t=document.createElement('div');t.className='toast '+type; t.style.position='fixed';t.style.top='20px';t.style.right='20px';t.style.background=type==='success'?'#10B981':(type==='info'?'#1B768E':'#EF4444');t.style.color='#fff';t.style.padding='12px 18px';t.style.borderRadius='10px';t.style.fontWeight='800';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2400);}
+function animateFeature(el){ el.style.transform='scale(.95)'; setTimeout(()=>el.style.transform='scale(1)',200); showToast('¡Funcionalidad próximamente! 🚀','info'); }
 
-            function update(currentTime) {
-                const elapsed = currentTime - startTime;
-                const progress = Math.min(elapsed / duration, 1);
-                const currentValue = Math.floor(startValue + (targetValue - startValue) * progress);
-                
-                if (isCurrency) {
-                    element.textContent = ' + currentValue.toLocaleString();
-                } else {
-                    element.textContent = currentValue.toLocaleString();
-                }
+// === Form submit con API ===
+async function submitProject(event){
+  event.preventDefault();
+  const formData={
+    nombre_proyecto:document.getElementById('projectName').value.trim(),
+    descripcion:document.getElementById('projectDescription').value.trim(),
+    integrantes:document.getElementById('teamMembers').value.split(',').map(s=>s.trim()).filter(Boolean),
+    funding_necesario:parseInt(document.getElementById('fundingAmount').value,10),
+    categoria:document.getElementById('projectCategory').value
+  };
+  const btn=event.target.querySelector('.submit-btn');const orig=btn.innerHTML;btn.innerHTML='<div class="loading"></div> Enviando...';btn.disabled=true;
+  try{
+    if (!API_BASE || API_BASE.includes('%%API_BASE%%')) throw new Error('API no configurada');
+    const res=await fetch(API_PROJECTS,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(formData)});
+    const data=await res.json(); if(!res.ok||!data.ok) throw new Error(data.error||'Error al guardar');
+    projectsData.unshift(formData); projectCategories[formData.nombre_proyecto]=formData.categoria; projectVotes[formData.nombre_proyecto]=0; updateStats(); renderProjects();
+    closeModal('uploadModal'); showToast('¡Proyecto enviado y guardado! 🚀','success'); event.target.reset();
+  }catch(e){console.error(e); showToast('Error: '+e.message,'error');}
+  finally{btn.innerHTML=orig; btn.disabled=false;}
+}
+</script>
 
-                if (progress < 1) {
-                    requestAnimationFrame(update);
-                }
-            }
+<!-- Modales mínimos (sube tu proyecto) -->
+<div id="uploadModal" class="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9990;">
+  <div class="modal-content" style="background:#fff;margin:5% auto;padding:30px;max-width:600px;border-radius:16px;position:relative;color:#012538">
+    <span style="position:absolute;top:10px;right:16px;font-size:28px;cursor:pointer" onclick="this.closest('.modal').style.display='none';document.body.style.overflow='auto';">&times;</span>
+    <h2 style="margin-bottom:14px"><i class="fas fa-rocket"></i> Sube tu Proyecto</h2>
+    <form id="uploadForm" onsubmit="submitProject(event)">
+      <div class="form-group"><label>Nombre del Proyecto *</label><input id="projectName" required style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"></div>
+      <div class="form-group"><label>Descripción *</label><textarea id="projectDescription" required rows="4" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"></textarea></div>
+      <div class="form-group"><label>Integrantes (separados por coma) *</label><input id="teamMembers" required style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"></div>
+      <div class="form-group"><label>Funding Necesario (USD) *</label><input id="fundingAmount" required type="number" min="1000" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"></div>
+      <div class="form-group"><label>Categoría *</label>
+        <select id="projectCategory" required style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px">
+          <option value="">Selecciona</option><option value="tech">Tecnología</option><option value="social">Social</option><option value="eco">Ecología</option><option value="health">Salud</option><option value="education">Educación</option><option value="finance">Finanzas</option>
+        </select>
+      </div>
+      <button type="submit" class="submit-btn" style="margin-top:10px;background:#FB9833;color:#012538;border:none;padding:12px 16px;border-radius:10px;font-weight:800;cursor:pointer">Enviar</button>
+    </form>
+  </div>
+</div>
 
-            requestAnimationFrame(update);
-        }
-
-        // Renderizar proyectos
-        function renderProjects() {
-            const container = document.getElementById('projectsGrid');
-            const filteredProjects = currentFilter === 'all' 
-                ? projectsData 
-                : projectsData.filter(p => projectCategories[p.nombre_proyecto] === currentFilter);
-
-            container.innerHTML = filteredProjects.map((project, index) => `
-                <div class="project-card" data-category="${projectCategories[project.nombre_proyecto] || 'tech'}">
-                    <div class="project-header">
-                        <div>
-                            <h3 class="project-title">${project.nombre_proyecto}</h3>
-                        </div>
-                        <div class="project-funding">${project.funding_necesario.toLocaleString()}</div>
-                    </div>
-                    <p class="project-description">${project.descripcion}</p>
-                    <div class="project-team">
-                        <span class="team-label"><i class="fas fa-users"></i> Equipo:</span>
-                        <div class="team-members">
-                            ${project.integrantes.map(member => `<span class="team-member">${member}</span>`).join('')}
-                        </div>
-                    </div>
-                    <div class="project-actions">
-                        <button class="vote-btn ${projectVotes[project.nombre_proyecto] > 0 ? 'voted' : ''}" 
-                                onclick="voteProject('${project.nombre_proyecto.replace(/'/g, "\\'")}')">
-                            <i class="fas fa-thumbs-up"></i>
-                            Votar
-                        </button>
-                        <span class="vote-count">
-                            <i class="fas fa-heart"></i> ${projectVotes[project.nombre_proyecto] || 0}
-                        </span>
-                    </div>
-                </div>
-            `).join('');
-
-            // Animar entrada
-            const cards = container.querySelectorAll('.project-card');
-            cards.forEach((card, index) => {
-                card.style.opacity = '0';
-                card.style.transform = 'translateY(30px)';
-                setTimeout(() => {
-                    card.style.transition = 'all 0.6s ease';
-                    card.style.opacity = '1';
-                    card.style.transform = 'translateY(0)';
-                }, index * 100);
-            });
-        }
-
-        // Votar proyecto
-        function voteProject(projectName) {
-            if (!projectVotes[projectName]) {
-                projectVotes[projectName] = 0;
-            }
-            
-            projectVotes[projectName]++;
-            updateStats();
-            renderProjects();
-            
-            showToast(`¡Votaste por ${projectName}! 🎉`, 'success');
-            createConfetti();
-        }
-
-        // Filtrar proyectos
-        function filterProjects(category) {
-            currentFilter = category;
-            
-            // Actualizar botones
-            document.querySelectorAll('.filter-btn').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            event.target.classList.add('active');
-            
-            renderProjects();
-        }
-
-        // Modales
-        function openModal(modalId) {
-            const modal = document.getElementById(modalId);
-            modal.style.display = 'block';
-            document.body.style.overflow = 'hidden';
-            
-            setTimeout(() => {
-                const firstInput = modal.querySelector('input, textarea, select');
-                if (firstInput) firstInput.focus();
-            }, 100);
-        }
-
-        function closeModal(modalId) {
-            const modal = document.getElementById(modalId);
-            modal.style.display = 'none';
-            document.body.style.overflow = 'auto';
-        }
-
-        // Enviar proyecto
-        function submitProject(event) {
-            event.preventDefault();
-            
-            const formData = {
-                nombre_proyecto: document.getElementById('projectName').value,
-                descripcion: document.getElementById('projectDescription').value,
-                integrantes: document.getElementById('teamMembers').value.split(',').map(s => s.trim()),
-                funding_necesario: parseInt(document.getElementById('fundingAmount').value),
-                categoria: document.getElementById('projectCategory').value
-            };
-
-            const submitBtn = event.target.querySelector('.submit-btn');
-            const originalText = submitBtn.innerHTML;
-            submitBtn.innerHTML = '<div class="loading"></div> Enviando...';
-            submitBtn.disabled = true;
-
-            setTimeout(() => {
-                // Agregar proyecto
-                projectsData.unshift(formData);
-                projectCategories[formData.nombre_proyecto] = formData.categoria;
-                projectVotes[formData.nombre_proyecto] = 0;
-                
-                updateStats();
-                renderProjects();
-                
-                closeModal('uploadModal');
-                showToast('¡Proyecto enviado exitosamente! 🚀', 'success');
-                
-                document.getElementById('uploadForm').reset();
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
-                
-                createConfetti();
-            }, 2000);
-        }
-
-        // Enviar contacto
-        function submitContact(event) {
-            event.preventDefault();
-            
-            const submitBtn = event.target.querySelector('.submit-btn');
-            const originalText = submitBtn.innerHTML;
-            submitBtn.innerHTML = '<div class="loading"></div> Enviando...';
-            submitBtn.disabled = true;
-
-            setTimeout(() => {
-                closeModal('contactModal');
-                showToast('¡Mensaje enviado correctamente! 📧', 'success');
-                
-                document.getElementById('contactForm').reset();
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
-            }, 1500);
-        }
-
-        // Navegación
-        function scrollToSection(sectionId) {
-            const element = document.getElementById(sectionId);
-            if (element) {
-                element.scrollIntoView({
-                    behavior: 'smooth',
-                    block: 'start'
-                });
-            }
-        }
-
-        function scrollToTop() {
-            window.scrollTo({
-                top: 0,
-                behavior: 'smooth'
-            });
-        }
-
-        // Toast notifications
-        function showToast(message, type = 'success') {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.className = `toast ${type}`;
-            
-            setTimeout(() => toast.classList.add('show'), 100);
-            setTimeout(() => toast.classList.remove('show'), 3000);
-        }
-
-        // Animar features
-        function animateFeature(element) {
-            element.style.transform = 'scale(0.95)';
-            setTimeout(() => {
-                element.style.transform = 'scale(1)';
-            }, 200);
-            
-            showToast('¡Funcionalidad próximamente! 🚀', 'info');
-        }
-
-        // Estado de DB
-        function updateDbStatus(hasDb, count) {
-            const badge = document.getElementById('dbBadge');
-            const info = document.getElementById('dbInfo');
-            
-            if (hasDb) {
-                badge.style.display = 'inline-block';
-                badge.textContent = `DB: ${count} proyectos`;
-                badge.style.background = 'var(--success-green)';
-                info.innerHTML = `📊 Base de datos conectada • <span style="color: var(--primary-orange);">${count} proyectos cargados</span>`;
-            } else {
-                badge.style.display = 'inline-block';
-                badge.textContent = 'DEMO';
-                badge.style.background = 'var(--warning-yellow)';
-                badge.style.color = 'var(--primary-dark)';
-                info.innerHTML = '🔧 Modo demostración • <span style="color: var(--primary-orange);">Datos de ejemplo</span>';
-            }
-        }
-
-        // Efecto confetti
-        function createConfetti() {
-            const colors = ['#FB9833', '#1B768E', '#10B981', '#F59E0B'];
-            
-            for (let i = 0; i < 30; i++) {
-                setTimeout(() => {
-                    const confetti = document.createElement('div');
-                    confetti.style.position = 'fixed';
-                    confetti.style.left = Math.random() * 100 + '%';
-                    confetti.style.top = '-10px';
-                    confetti.style.width = '8px';
-                    confetti.style.height = '8px';
-                    confetti.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
-                    confetti.style.borderRadius = '50%';
-                    confetti.style.zIndex = '1002';
-                    confetti.style.pointerEvents = 'none';
-                    confetti.style.transition = 'all 2s ease-out';
-                    
-                    document.body.appendChild(confetti);
-                    
-                    setTimeout(() => {
-                        confetti.style.top = '100vh';
-                        confetti.style.transform = 'rotate(360deg)';
-                        confetti.style.opacity = '0';
-                    }, 100);
-                    
-                    setTimeout(() => {
-                        if (confetti.parentNode) {
-                            confetti.parentNode.removeChild(confetti);
-                        }
-                    }, 2100);
-                }, i * 50);
-            }
-        }
-
-        console.log('✅ PitchZone cargado completamente!');
-        console.log('💡 Funcionalidades activas:');
-        console.log('  - Subir proyectos ✅');
-        console.log('  - Sistema de votación ✅');
-        console.log('  - Filtros por categoría ✅');
-        console.log('  - Formulario de contacto ✅');
-        console.log('  - Animaciones y efectos ✅');
-    </script>
 </body>
 </html>
 HTMLEOF
 
-# Configurar permisos
+# Inyectar seed de proyectos si existe
+if [ -f /var/www/html/proyectos.json ]; then
+  sudo sed -i '/<!--SEED-HERE-->/{
+    r /var/www/html/proyectos.json
+    d
+  }' /var/www/html/index.html
+else
+  sudo sed -i 's/<!--SEED-HERE-->//g' /var/www/html/index.html
+fi
+
+# Inyectar seed de universidades si existe
+if [ -f /var/www/html/universidades.json ]; then
+  sudo sed -i '/<!--UNIVERSIDADES-SEED-->/{
+    r /var/www/html/universidades.json
+    d
+  }' /var/www/html/index.html
+else
+  sudo sed -i 's/<!--UNIVERSIDADES-SEED-->//g' /var/www/html/index.html
+fi
+
+# Inyectar seed de eventos si existe
+if [ -f /var/www/html/eventos.json ]; then
+  sudo sed -i '/<!--EVENTS-SEED-->/{
+    r /var/www/html/eventos.json
+    d
+  }' /var/www/html/index.html
+else
+  sudo sed -i 's/<!--EVENTS-SEED-->//g' /var/www/html/index.html
+fi
+
 sudo chown -R apache:apache /var/www/html/
 sudo chmod -R 755 /var/www/html/
-
-# Restart Apache
 sudo systemctl restart httpd
-
-# Verificar status
-sudo systemctl status httpd --no-pager
-
-echo ""
-echo "✅ PitchZone MEJORADO desplegado exitosamente!"
-echo "🎨 Características implementadas:"
-echo "   • Diseño completamente responsivo"
-echo "   • Sistema de votación interactivo"
-echo "   • Formularios funcionales"
-echo "   • Animaciones y efectos visuales"
-echo "   • Filtros por categoría"
-echo "   • Notificaciones toast"
-echo "   • Navegación suave"
-echo "   • Base de datos JSON integrada"
-echo ""
-EOF
+echo "✅ Sitio desplegado (seeds aplicados si existían)."
+RSCRIPT
 
 chmod +x deploy-pitchzone-enhanced.sh
 
-echo "⏳ Esperando a que la instancia esté lista para el despliegue mejorado..."
-sleep 30
+# --- 5) Esperar SSH real, subir script remoto y ejecutarlo ---
+echo "⏳ Esperando a que la instancia esté lista (SSH)..."
+for i in {1..30}; do
+  if ssh -i "$KEY_PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=2 "$REMOTE" "echo ok" >/dev/null 2>&1; then
+    echo "✅ SSH disponible."
+    break
+  fi
+  sleep 3
+done
 
-echo "🚀 Subiendo y ejecutando el script mejorado en la EC2..."
-scp -i "$KEY_PEM" -o StrictHostKeyChecking=no deploy-pitchzone-enhanced.sh ec2-user@"$PUBLIC_IP":/tmp/
+echo "📤 Subiendo script remoto..."
+scp -i "$KEY_PEM" -o StrictHostKeyChecking=no deploy-pitchzone-enhanced.sh "$REMOTE":/tmp/
 
-# Ejecutar el script mejorado
-ssh -i "$KEY_PEM" -o StrictHostKeyChecking=no ec2-user@"$PUBLIC_IP" "chmod +x /tmp/deploy-pitchzone-enhanced.sh && sudo /tmp/deploy-pitchzone-enhanced.sh"
+echo "🖥️  Ejecutando script remoto..."
+ssh -i "$KEY_PEM" -o StrictHostKeyChecking=no "$REMOTE" "chmod +x /tmp/deploy-pitchzone-enhanced.sh && sudo /tmp/deploy-pitchzone-enhanced.sh"
 
-echo ""
-echo "🎉 ¡PITCHZONE MEJORADO DESPLEGADO EXITOSAMENTE!"
-echo ""
-echo "🌐 Tu sitio web está disponible en: http://$PUBLIC_IP"
-echo "📱 Completamente funcional desde cualquier dispositivo"
-echo ""
-echo "🚀 NUEVAS CARACTERÍSTICAS:"
-echo "   ✅ Sistema de votación en tiempo real"
-echo "   ✅ Formulario para subir proyectos"
-echo "   ✅ Filtros por categoría (Tech, Social, Eco, etc.)"
-echo "   ✅ Formulario de contacto funcional"
-echo "   ✅ Animaciones y efectos visuales"
-echo "   ✅ Diseño completamente responsivo"
-echo "   ✅ Navegación suave entre secciones"
-echo "   ✅ Notificaciones interactivas"
-echo "   ✅ Estadísticas en tiempo real"
-echo "   ✅ Logo personalizado integrado"
-echo ""
-echo "📋 ARCHIVOS IMPORTANTES:"
-echo "   • Web: http://$PUBLIC_IP"
-echo "   • JSON: http://$PUBLIC_IP/proyectos.json"
-echo "   • Logo: http://$PUBLIC_IP/logo_pitchzone.png"
-echo ""
-echo "🎓 ¡PERFECTO PARA TU PRESENTACIÓN EN CLASE!"
-echo ""
+# --- 6) Sustituir API_BASE en el HTML (en la EC2) ---
+echo "✏️ Inyectando API_BASE en index.html remoto ..."
+ssh -i "$KEY_PEM" -o StrictHostKeyChecking=no "$REMOTE" "sudo sed -i \"s|%%API_BASE%%|$API_BASE|g\" /var/www/html/index.html && sudo systemctl restart httpd"
 
-# Limpiar archivos temporales
+# --- 7) Limpieza local ---
 rm -f deploy-pitchzone-enhanced.sh
 
-echo "🧹 Archivos temporales limpiados"
-echo "📁 Información guardada en: infraestructura-info.txt"
 echo ""
-echo "🔧 Para reconectar por SSH:"
-echo "ssh -i $KEY_PEM ec2-user@$PUBLIC_IP"
+echo "🎉 ¡PITCHZONE desplegado con BACKEND!"
+echo "🌐 Web:   http://$PUBLIC_IP"
+echo "🛠️  API:  $API_BASE"
+echo "   • POST $API_BASE/projects"
+echo "   • GET  $API_BASE/projects"
 echo ""
+echo "✅ Si el POST está activo, el botón 'Sube tu proyecto' guarda en DynamoDB."
+echo ""
+
+

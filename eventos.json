@@ -1,0 +1,28 @@
+{
+  "eventos": [
+    {
+      "titulo": "PitchZone Demo Day LATAM",
+      "fecha": "2025-08-20",
+      "hora": "18:00",
+      "modalidad": "Online",
+      "descripcion": "Presenta tu pitch a mentores e inversionistas.",
+      "registro_url": "https://tusitio/registro-demo-day"
+    },
+    {
+      "titulo": "Taller: Storytelling para Pitches",
+      "fecha": "2025-08-27",
+      "hora": "17:00",
+      "modalidad": "Híbrido",
+      "descripcion": "Estructura un pitch ganador en 60 minutos.",
+      "registro_url": "https://tusitio/registro-taller"
+    },
+    {
+      "titulo": "Matchmaking Startups × Universidades",
+      "fecha": "2025-09-03",
+      "hora": "19:00",
+      "modalidad": "Online",
+      "descripcion": "Conecta con universidades para alianzas y talento.",
+      "registro_url": "https://tusitio/registro-match"
+    }
+  ]
+}
